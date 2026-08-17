@@ -97,12 +97,57 @@ Server 启动后会打印 64 位 NodeID。然后启动 Client，随机监听一�
 
 fknat 暴露的是 TCP 监听端口和 TCP 后端。KCP 是 natP2p 网络中的底层传输路径，不表示本地端口是 UDP。UDP 应用代理需要 SDK 额外提供数据报会话语义后再实现。
 
+## 累计计费凭证
+
+Relay 不会逐包访问 CA Web。它先验证并累计端到端计费 Record，再在下列任一条件先满足时要求付款方双签一张累计凭证：
+
+- 自上一张凭证后的认证 E2E Record 累计接近 50 MiB（52,428,800 bytes）；
+- 首个尚未双签的 Record 已等待 1 分钟。
+
+正常关闭时还会强制冲刷不足 50 MiB、也未满 1 分钟的尾单。双签凭证先进入 Relay 的持久 `waitSubmit` 队列，再由后台提交 CA；CA 暂时不可达不会进入逐包转发热路径。
+
+单个原子 Record 仍最多为 1 MiB。若下一条 Record 会使累计值越过 50 MiB 上限，Relay 会在接收该 Record 前提交当前窗口，因此实测单张增量可能略低于 50 MiB。当前 SDK 还会把节点层 `[]byte` 放入 JSON 信封，JSON 的 base64 开销属于认证 E2E Record 字节，所以原始 TCP 文件大小与 CA 看到的累计字节不是严格 1:1。
+
+压缩凭证频率会扩大信用敞口：单付款方、单 Relay、单 Session 最多可先产生约一个窗口的未双签流量，余额不足可能在下一次 CA 结算时才触发 cutoff。
+
+## 吞吐调优
+
+默认值偏向受控内存使用。高带宽时延积公网链路可以在 Client、Server 和 Relay 上一致设置以下环境变量：
+
+| 变量 | 默认值 | 约束/作用 |
+|---|---:|---|
+| `TUNNEL_MAX_CHUNK` | 65536 | 单条 MUX DATA 的业务字节数，最小 1024 |
+| `TUNNEL_STREAM_SEND_WINDOW` | 8 | 单逻辑流并发在途 DATA 数，最小 1 |
+| `TUNNEL_SEND_WINDOW` | 32 | 整个 carrier 并发在途 DATA 数，最小 1 |
+| `BNFS_KCP_SEND_WINDOW` | 256 | KCP 发送窗口，范围 32..65535 |
+| `BNFS_KCP_RECEIVE_WINDOW` | 1024 | KCP 接收窗口，范围 32..65535 |
+| `BNFS_KCP_SESSION_BUFFER_BYTES` | 4194304 | KCP socket 缓冲，范围 1..256 MiB |
+
+本次公网受控验证使用了 `TUNNEL_MAX_CHUNK=262144`、流窗口 32、carrier 窗口 128、KCP 发送/接收窗口 1536/6144 和 16 MiB socket 缓冲。放大窗口会增加每个活动会话的内存上限，应结合实际 RTT、丢包和并发数逐步调整。
+
 ## 验证
 
 ```bash
 go test ./...
 go build -o bin/fknat .
 ```
+
+实际部署后可使用仓库内的有界传输长压脚本。下面的示例持续 30 分钟，每 40 秒启动一次 100–200 MiB 下载，并为每条成功传输校验 SHA-256：
+
+```bash
+BASE_URL=http://127.0.0.1:18081 \
+OUTPUT_DIR=/tmp/fknat-transfer-soak \
+DURATION_SECONDS=1800 \
+INTERVAL_SECONDS=40 \
+MIN_SIZE_MIB=100 \
+MAX_SIZE_MIB=200 \
+TRANSFER_TIMEOUT_SECONDS=600 \
+bash scripts/transfer-soak.sh
+```
+
+`DURATION_SECONDS` 是发起新传输的调度窗口，不是所有传输共享的强制结束时间。到达该时间后脚本不再启动新任务，但会继续等待已启动任务各自的 `TRANSFER_TIMEOUT_SECONDS`，因此脚本总耗时最多可能接近两者之和。成功传输会校验 SHA-256；单条下载超时记为 `TIMEOUT`，下载前的校验和请求失败记为 `CHECKSUM_FAILED`。
+
+2026-08-17 的旧策略 30 分钟过载测试和新 50 MiB/1 分钟策略受控验证见 [实测报告](REAL_TRANSFER_AND_BILLING_REPORT_2026-08-17.md)。
 
 ## License
 

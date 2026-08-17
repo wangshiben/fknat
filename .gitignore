@@ -1,5 +1,6 @@
 /bin/
 /dist/
+/test-results/
 *.log
 coverage.out
 .DS_Store
