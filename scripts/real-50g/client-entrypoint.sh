@@ -8,6 +8,10 @@ umask 077
 : "${FKNAT_CA_URL:?}"
 : "${SERVER_NODE_ID:?}"
 : "${CLIENT_NAME:?}"
+CLIENT_LISTEN_PORT=${CLIENT_LISTEN_PORT:-18081}
+CLIENT_BASE_URL="http://127.0.0.1:${CLIENT_LISTEN_PORT}"
+PREFLIGHT_SIZE_MIB=${PREFLIGHT_SIZE_MIB:-16}
+PREFLIGHT_MAX_TIME_SECONDS=${PREFLIGHT_MAX_TIME_SECONDS:-300}
 
 mkdir -p /results/sdk-logs
 fknat_pid=""
@@ -26,7 +30,7 @@ trap cleanup EXIT INT TERM
   --billing-key /state/billing-key.json \
   --identity /state/identity.key \
   --server-id "$SERVER_NODE_ID" \
-  --listen 127.0.0.1:18081 \
+  --listen "127.0.0.1:${CLIENT_LISTEN_PORT}" \
   --dial-attempts 30 \
   --retry-delay 3s \
   --reconnect-delay 3s \
@@ -48,10 +52,11 @@ done
 [[ $ready == 1 ]]
 
 variant="preflight-${CLIENT_NAME}"
-expected=$(curl -fsS --max-time 60 "http://127.0.0.1:18081/checksum?size_mb=16&variant=${variant}")
+expected=$(curl -fsS --max-time 60 \
+  "${CLIENT_BASE_URL}/checksum?size_mb=${PREFLIGHT_SIZE_MIB}&variant=${variant}")
 preflight_started=$(date +%s)
-curl -fsS --max-time 300 -o /results/preflight.bin \
-  "http://127.0.0.1:18081/file?size_mb=16&variant=${variant}"
+curl -fsS --max-time "$PREFLIGHT_MAX_TIME_SECONDS" -o /results/preflight.bin \
+  "${CLIENT_BASE_URL}/file?size_mb=${PREFLIGHT_SIZE_MIB}&variant=${variant}"
 preflight_finished=$(date +%s)
 actual=$(sha256sum /results/preflight.bin | awk '{print $1}')
 rm -f /results/preflight.bin
@@ -59,7 +64,8 @@ if [[ $expected != "$actual" || ! $actual =~ ^[0-9a-f]{64}$ ]]; then
   printf 'status\texpected_sha\tactual_sha\nFAIL\t%s\t%s\n' "$expected" "$actual" > /results/preflight.tsv
   exit 1
 fi
-printf 'status\tbytes\tduration_seconds\tsha256\nPASS\t16777216\t%s\t%s\n' \
+printf 'status\tbytes\tduration_seconds\tsha256\nPASS\t%s\t%s\t%s\n' \
+  "$((PREFLIGHT_SIZE_MIB * 1024 * 1024))" \
   "$((preflight_finished - preflight_started))" "$actual" > /results/preflight.tsv
 touch /results/ready
 

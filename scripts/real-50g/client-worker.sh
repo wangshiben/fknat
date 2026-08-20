@@ -4,6 +4,8 @@ set -uo pipefail
 umask 077
 
 : "${CLIENT_NAME:?}"
+CLIENT_LISTEN_PORT=${CLIENT_LISTEN_PORT:-18081}
+CLIENT_BASE_URL="http://127.0.0.1:${CLIENT_LISTEN_PORT}"
 plan=/plan/plan.tsv
 results=/results/transfers.tsv
 progress=/results/progress.env
@@ -11,6 +13,7 @@ payload=/results/current.bin
 metrics=/results/current.metrics
 errors=/results/current.error
 maximum_attempts=${MAX_ATTEMPTS_PER_FILE:-30}
+file_max_time_seconds=${FILE_MAX_TIME_SECONDS:-900}
 
 printf 'client\tfile_index\tattempt\tsize_mib\tplanned_bytes\tstarted_epoch\tfinished_epoch\tduration_seconds\treceived_bytes\thttp_code\tcurl_rc\tspeed_bps\texpected_sha\tactual_sha\tstatus\terror\n' > "$results"
 
@@ -29,7 +32,7 @@ while IFS=$'\t' read -r file_index size_mib variant; do
     started_epoch=$(date +%s)
     rm -f "$payload" "$metrics" "$errors"
     expected_sha=$(curl -fsS --connect-timeout 30 --max-time 60 \
-      "http://127.0.0.1:18081/checksum?size_mb=${size_mib}&variant=${variant}" \
+      "${CLIENT_BASE_URL}/checksum?size_mb=${size_mib}&variant=${variant}" \
       2>"$errors" | tr -d '\r\n')
     if [[ ! $expected_sha =~ ^[0-9a-f]{64}$ ]]; then
       finished_epoch=$(date +%s)
@@ -40,9 +43,9 @@ while IFS=$'\t' read -r file_index size_mib variant; do
       continue
     fi
 
-    curl -fsS --connect-timeout 30 --max-time 900 -o "$payload" \
+    curl -fsS --connect-timeout 30 --max-time "$file_max_time_seconds" -o "$payload" \
       -w '%{http_code}\t%{size_download}\t%{time_total}\t%{speed_download}' \
-      "http://127.0.0.1:18081/file?size_mb=${size_mib}&variant=${variant}" \
+      "${CLIENT_BASE_URL}/file?size_mb=${size_mib}&variant=${variant}" \
       >"$metrics" 2>>"$errors"
     curl_rc=$?
     IFS=$'\t' read -r http_code received_bytes duration_seconds speed_bps < "$metrics" || true

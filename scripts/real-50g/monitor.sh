@@ -10,6 +10,9 @@ umask 077
 : "${UNIT_RELAY_SERVER:?}"
 : "${UNIT_RELAY_TUNNEL:?}"
 : "${UNIT_LOCAL_TUNNEL:?}"
+: "${RELAY_TCP_PATH:=direct}"
+: "${CONTAINER_PLACEMENT:=local}"
+: "${REMOTE_DOCKER_HOST:=}"
 : "${CA_PUBLIC_URL:?}"
 : "${CA_LOCAL_URL:?}"
 
@@ -22,6 +25,16 @@ printf 'epoch\tnode\tdepth\tpayload_bytes\tfile_bytes\tinspect_status\n' > "$que
 printf 'epoch\tnode\tunit\tnrestarts\tactive_state\n' > "$restarts"
 printf 'epoch\tlocal_status\tpublic_status\n' > "$ca_health"
 
+json_number() {
+  local key=$1 fallback=$2 value
+  value=$(sed -n "s/.*\"$key\":\([0-9][0-9]*\).*/\\1/p" | head -n 1)
+  if [[ $value =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$value"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
 inspect_queue() {
   local node=$1 queue_path=$2 output depth payload file_bytes status
   shift 2
@@ -29,8 +42,8 @@ inspect_queue() {
     "$REMOTE_DIR/billingqueue-inspect -path '$queue_path'; stat -c '%s' '$queue_path' 2>/dev/null || printf 0" 2>/dev/null)
   file_bytes=$(printf '%s\n' "$output" | tail -n 1)
   output=$(printf '%s\n' "$output" | head -n 1)
-  depth=$(printf '%s' "$output" | jq -r '.depth // 0' 2>/dev/null)
-  payload=$(printf '%s' "$output" | jq -r '.payload_bytes // 0' 2>/dev/null)
+  depth=$(printf '%s' "$output" | json_number depth 0)
+  payload=$(printf '%s' "$output" | json_number payload_bytes 0)
   if [[ $depth =~ ^[0-9]+$ && $payload =~ ^[0-9]+$ && $file_bytes =~ ^[0-9]+$ ]]; then
     status=PASS
   else
@@ -64,26 +77,69 @@ inspect_local_unit() {
   printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" local "$unit" "$nrestarts" "$active" >> "$restarts"
 }
 
-sample() {
-  local epoch names name state restart local_status public_status
-  epoch=$(date +%s)
-  names=$(docker ps -a --filter "label=fknat.real50g.run=$RUN_LABEL" --format '{{.Names}}')
-  for name in $names; do
-    state=$(docker inspect --format '{{.State.Status}}' "$name" 2>/dev/null || printf unavailable)
-    restart=$(docker inspect --format '{{.RestartCount}}' "$name" 2>/dev/null || printf -1)
+docker193() {
+  local quoted
+  printf -v quoted '%q ' "$@"
+  ssh -o BatchMode=yes -o ConnectTimeout=8 server4 \
+    "DOCKER_HOST='$REMOTE_DOCKER_HOST' '$REMOTE_DIR/docker-bin/docker' $quoted"
+}
+
+docker198() {
+  local quoted
+  printf -v quoted '%q ' "$@"
+  ssh -o BatchMode=yes -o ConnectTimeout=8 -p 30811 root@198.2.237.123 \
+    "DOCKER_HOST='$REMOTE_DOCKER_HOST' '$REMOTE_DIR/docker-bin/docker' $quoted"
+}
+
+sample_docker() {
+  local epoch=$1 location=$2 names inspect_rows name state restart
+  local -a running=()
+  shift 2
+  names=$("$@" ps -a --filter "label=fknat.real50g.run=$RUN_LABEL" --format '{{.Names}}' 2>/dev/null || true)
+  [[ -n $names ]] || return 0
+  inspect_rows=$("$@" inspect --format '{{.Name}}|{{.State.Status}}|{{.RestartCount}}' $names 2>/dev/null || true)
+  while IFS='|' read -r name state restart; do
+    [[ -n $name ]] || continue
+    name=${name#/}
+    [[ -n $state ]] || state=unavailable
+    [[ $restart =~ ^[0-9]+$ ]] || restart=-1
     if [[ $state == running ]]; then
-      docker stats --no-stream --format "${epoch}\t{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}\t{{.BlockIO}}\t{{.PIDs}}\t${state}\t${restart}" "$name" >> "$resources" 2>/dev/null || true
+      running+=("$name")
     else
-      printf '%s\t%s\t0%%\t0B / 0B\t0B / 0B\t0B / 0B\t0\t%s\t%s\n' "$epoch" "$name" "$state" "$restart" >> "$resources"
+      printf '%s\t%s/%s\t0%%\t0B / 0B\t0B / 0B\t0B / 0B\t0\t%s\t%s\n' \
+        "$epoch" "$location" "$name" "$state" "$restart" >> "$resources"
     fi
-  done
+  done <<< "$inspect_rows"
+  if ((${#running[@]} > 0)); then
+    "$@" stats --no-stream \
+      --format "${epoch}\t${location}/{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}\t{{.BlockIO}}\t{{.PIDs}}\trunning\t{{.Container}}" \
+      "${running[@]}" | while IFS=$'\t' read -r sample_epoch sample_name cpu memory net block pids sample_state container_id; do
+        restart=$(printf '%s\n' "$inspect_rows" | awk -F '|' -v target="/${sample_name#*/}" '$1 == target {print $3; exit}')
+        [[ $restart =~ ^[0-9]+$ ]] || restart=-1
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "$sample_epoch" "$sample_name" "$cpu" "$memory" "$net" "$block" "$pids" "$sample_state" "$restart"
+      done >> "$resources" 2>/dev/null || true
+  fi
+}
+
+sample() {
+  local epoch local_status public_status
+  epoch=$(date +%s)
+  if [[ $CONTAINER_PLACEMENT == relay-hosts ]]; then
+    sample_docker "$epoch" 193 docker193
+    sample_docker "$epoch" 198 docker198
+  else
+    sample_docker "$epoch" local docker
+  fi
 
   inspect_queue relay-client-index "$REMOTE_DIR/relay-client-index.waitsubmit" server4
   inspect_queue relay-server "$REMOTE_DIR/relay-server.waitsubmit" -p 30811 root@198.2.237.123
   inspect_unit relay-client-index "$UNIT_INDEX" server4
   inspect_unit relay-server "$UNIT_RELAY_SERVER" -p 30811 root@198.2.237.123
-  inspect_unit relay-tunnel "$UNIT_RELAY_TUNNEL" server4
-  inspect_local_unit "$UNIT_LOCAL_TUNNEL"
+  if [[ $RELAY_TCP_PATH == ssh ]]; then
+    inspect_unit relay-tunnel "$UNIT_RELAY_TUNNEL" server4
+    inspect_local_unit "$UNIT_LOCAL_TUNNEL"
+  fi
 
   local_status=DOWN
   public_status=DOWN

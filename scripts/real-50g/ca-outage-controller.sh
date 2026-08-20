@@ -15,7 +15,14 @@ printf 'sequence\tscheduled_epoch\tdown_epoch\tplanned_seconds\tpublic_unavailab
 restore_ca() {
   docker start "$CA_CONTAINER" >/dev/null 2>&1 || true
 }
-trap restore_ca EXIT INT TERM
+
+handle_signal() {
+  restore_ca
+  exit 143
+}
+
+trap restore_ca EXIT
+trap handle_signal INT TERM
 
 wait_until() {
   local target=$1 now delay
