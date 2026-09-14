@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	sdk "github.com/wangshiben/natP2pSDK"
+	"github.com/wangshiben/natP2pSDK/tunnel"
 )
 
 type memoryConnection struct {
@@ -124,15 +126,20 @@ func TestClientSessionManagerToServerTCPForwarding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenStream: %v", err)
 	}
+	localTunnel, localApplication := net.Pipe()
+	bridgeDone := make(chan error, 1)
+	go func() {
+		bridgeDone <- compressedBridge(localApplication, stream, compressionClientMode, tunnel.DefaultCopyOptions())
+	}()
 	payload := []byte("fknat tunnel integration\n")
-	if _, err := stream.Write(payload); err != nil {
+	if _, err := localTunnel.Write(payload); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 	response := make(chan []byte, 1)
 	readError := make(chan error, 1)
 	go func() {
 		buffer := make([]byte, len(payload))
-		_, readErr := io.ReadFull(stream, buffer)
+		_, readErr := io.ReadFull(localTunnel, buffer)
 		if readErr != nil {
 			readError <- readErr
 			return
@@ -150,7 +157,13 @@ func TestClientSessionManagerToServerTCPForwarding(t *testing.T) {
 		t.Fatalf("timed out waiting for forwarded response: %v", ctx.Err())
 	}
 
-	_ = stream.Close()
+	_ = localTunnel.Close()
+	_ = localApplication.Close()
+	select {
+	case <-bridgeDone:
+	case <-time.After(time.Second):
+		t.Fatal("compressed bridge did not stop")
+	}
 	_ = manager.Close()
 	cancel()
 	_ = backend.Close()
@@ -163,6 +176,79 @@ func TestClientSessionManagerToServerTCPForwarding(t *testing.T) {
 	case <-backendDone:
 	case <-time.After(time.Second):
 		t.Fatal("backend goroutine did not stop")
+	}
+}
+
+func TestServeClientConnectionEnforcesPerSessionStreamLimit(t *testing.T) {
+	backend, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	acceptedBackend := make(chan net.Conn, 1)
+	go func() {
+		connection, acceptErr := backend.Accept()
+		if acceptErr == nil {
+			acceptedBackend <- connection
+		}
+	}()
+
+	clientConnection, serverConnection := newMemoryConnectionPair()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var logs bytes.Buffer
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		serveClientConnectionWithLimits(ctx, serverConnection, backend.Addr().String(), 1, make(chan struct{}, 2), log.New(&logs, "", 0))
+	}()
+
+	clientSession, err := tunnel.NewClientSession(ctx, clientConnection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := clientSession.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("open first stream: %v", err)
+	}
+	var backendConnection net.Conn
+	select {
+	case backendConnection = <-acceptedBackend:
+	case <-ctx.Done():
+		t.Fatalf("first stream did not occupy backend: %v", ctx.Err())
+	}
+
+	second, err := clientSession.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("open second stream: %v", err)
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		var buffer [1]byte
+		_, readErr := second.Read(buffer[:])
+		readDone <- readErr
+	}()
+	select {
+	case readErr := <-readDone:
+		if readErr == nil {
+			t.Fatal("rejected stream read unexpectedly succeeded")
+		}
+	case <-ctx.Done():
+		t.Fatalf("rejected stream was not closed: %v", ctx.Err())
+	}
+	if !strings.Contains(logs.String(), "stage=session_stream_limit") {
+		t.Fatalf("missing structured rejection log: %s", logs.String())
+	}
+
+	_ = second.Close()
+	_ = first.Close()
+	_ = backendConnection.Close()
+	_ = clientSession.Close()
+	cancel()
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("limited server did not stop")
 	}
 }
 

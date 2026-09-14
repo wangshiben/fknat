@@ -7,7 +7,10 @@ umask 077
 : "${RUN_LABEL:?}"
 : "${REMOTE_DIR:?}"
 : "${UNIT_INDEX:?}"
+: "${UNIT_RELAY_CLIENT:?}"
 : "${UNIT_RELAY_SERVER:?}"
+: "${SERVER_RELAY_SSH_TARGET:=root@198.2.237.123}"
+: "${SERVER_RELAY_SSH_PORT:=30811}"
 : "${UNIT_RELAY_TUNNEL:?}"
 : "${UNIT_LOCAL_TUNNEL:?}"
 : "${RELAY_TCP_PATH:=direct}"
@@ -133,9 +136,11 @@ sample() {
   fi
 
   inspect_queue relay-client-index "$REMOTE_DIR/relay-client-index.waitsubmit" server4
-  inspect_queue relay-server "$REMOTE_DIR/relay-server.waitsubmit" -p 30811 root@198.2.237.123
+  inspect_queue relay-client "$REMOTE_DIR/relay-client.waitsubmit" -p "${CLIENT_RELAY_SSH_PORT:-22}" "${CLIENT_RELAY_SSH_TARGET:-root@160.202.47.24}"
+  inspect_queue relay-server "$REMOTE_DIR/relay-server.waitsubmit" -p "$SERVER_RELAY_SSH_PORT" "$SERVER_RELAY_SSH_TARGET"
   inspect_unit relay-client-index "$UNIT_INDEX" server4
-  inspect_unit relay-server "$UNIT_RELAY_SERVER" -p 30811 root@198.2.237.123
+  inspect_unit relay-client "$UNIT_RELAY_CLIENT" -p "${CLIENT_RELAY_SSH_PORT:-22}" "${CLIENT_RELAY_SSH_TARGET:-root@160.202.47.24}"
+  inspect_unit relay-server "$UNIT_RELAY_SERVER" -p "$SERVER_RELAY_SSH_PORT" "$SERVER_RELAY_SSH_TARGET"
   if [[ $RELAY_TCP_PATH == ssh ]]; then
     inspect_unit relay-tunnel "$UNIT_RELAY_TUNNEL" server4
     inspect_local_unit "$UNIT_LOCAL_TUNNEL"

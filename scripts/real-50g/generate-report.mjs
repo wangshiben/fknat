@@ -6,6 +6,7 @@ const root = path.resolve(process.argv[2] ?? "");
 if (!process.argv[2] || root === path.parse(root).root) throw new Error("results directory is required");
 
 const metadata = readEnv(path.join(root, "metadata.env"));
+const serverCount = number(metadata.server_count) || 5;
 const plans = [];
 const transfers = [];
 const clients = [];
@@ -18,7 +19,7 @@ for (let index = 1; index <= 10; index += 1) {
   const passing = rows.filter((row) => row.status === "PASS");
   clients.push({
     client,
-    server: `server-${String(Math.ceil(index / 2)).padStart(2, "0")}`,
+    server: `server-${String((index - 1) % serverCount + 1).padStart(2, "0")}`,
     plannedMiB: sum(plan, (row) => number(row.size_mib)),
     files: plan.length,
     passed: passing.length,
@@ -33,7 +34,9 @@ for (let index = 1; index <= 10; index += 1) {
 const passes = transfers.filter((row) => row.status === "PASS");
 const failures = transfers.filter((row) => row.status !== "PASS");
 const totalBytes = sum(passes, (row) => number(row.received_bytes));
-const expectedBytes = 50 * 1024 * 1024 * 1024;
+const expectedBytes = number(metadata.total_bytes) || 50 * 1024 * 1024 * 1024;
+const expectedGiB = expectedBytes / 1024 ** 3;
+const expectedPerClientMiB = number(metadata.per_client_mib) || expectedBytes / 10 / 1024 ** 2;
 const planBytes = sum(plans, (row) => number(row.size_mib) * 1024 * 1024);
 const sizesValid = plans.every((row) => number(row.size_mib) >= 100 && number(row.size_mib) <= 200);
 const hashesValid = passes.every((row) => /^[0-9a-f]{64}$/.test(row.expected_sha ?? "") && row.expected_sha === row.actual_sha);
@@ -53,13 +56,12 @@ const endpointTransport = metadata.endpoint_transport === "tcp-only"
 const relayTCPPath = metadata.relay_tcp_path === "ssh" ? "受限 SSH 转发" : "公网直连";
 const relayTransport = metadata.relay_bridge_kcp === "1"
   ? "Relay 间主数据桥使用 KCP-only；当前 bridge-mux 不具备自动 TCP fallback"
-  : `Relay 间主数据桥仅 TCP（193→198 经${relayTCPPath}）`;
-const topologyValid = metadata.container_placement === "local";
-const topologyTransport = metadata.container_placement === "relay-hosts"
-  ? `非正式验收拓扑：10 个 Client 容器部署在 193 Relay 主机，5 个 Server 容器部署在 198 Relay 主机，绕过了两侧端点到公网 Relay 的实际链路`
-  : metadata.relay_tcp_path === "ssh"
-    ? "10 个 Client 和 5 个 Server 容器均部署在本机；Client 经公网连接 193 Relay，Server 经公网连接 198 Relay；UDP/KCP 直连，TCP fallback 使用临时受限 SSH 转发"
-    : "10 个 Client 和 5 个 Server 容器均部署在本机；Client 经公网 TCP/UDP 连接 193 Relay，Server 经公网 TCP/UDP 连接 198 Relay；不使用 SSH 数据隧道";
+  : `Relay 间主数据桥仅 TCP（Client Relay→Server Relay，经${relayTCPPath}）`;
+const clientPlacement = metadata.client_container_placement ?? (metadata.container_placement === "relay-hosts" ? "remote" : "local");
+const serverPlacement = metadata.server_container_placement ?? (metadata.container_placement === "relay-hosts" ? "remote" : "local");
+const topologyValid = clientPlacement === "local" && serverPlacement === "remote" && serverCount === 2;
+const topologyTransport = `10 个 Client 部署在本机 NatClient；${serverCount} 个 Server 部署在 198.2.237.123；Server 经 191.223.217.76 Server Relay，Client 经 198.2.237.123 Client Relay；193 仅提供 Index`;
+const topologyRequirement = `10 个 Client 在本机、${serverCount} 个 Server 在 198.2.237.123，Server Relay 为 ${metadata.server_relay_address ?? "191.223.217.76:19000"}，Client Relay 为 ${metadata.client_relay_address ?? "198.2.237.123:9000"}`;
 
 const outages = readTSV(path.join(root, "ca-outages.tsv"));
 const outageAnalysis = outages.map((outage) => {
@@ -116,8 +118,12 @@ const resources = {
   clients: summarizeDockerResources(resourceRows.filter((row) => /-client-\d+$/.test(row.container ?? ""))),
   servers: summarizeDockerResources(resourceRows.filter((row) => /-server-\d+$/.test(row.container ?? ""))),
   ca: summarizeDockerResources(resourceRows.filter((row) => /-ca$/.test(row.container ?? ""))),
-  relayClientPeak: maximum(
+  relayIndexPeak: maximum(
     relayResourceRows.filter((row) => row.node === "relay-client-index"),
+    (row) => number(row.memory_peak_bytes),
+  ),
+  relayClientPeak: maximum(
+    relayResourceRows.filter((row) => row.node === "relay-client"),
     (row) => number(row.memory_peak_bytes),
   ),
   relayServerPeak: maximum(
@@ -129,7 +135,7 @@ const configuredServerRate = number(metadata.server_rate_kibps) > 0
   ? `${number(metadata.server_rate_kibps)} KiB/s（每个 Server 聚合）`
   : `${number(metadata.server_rate_mibps)} MiB/s（每个 Server 聚合）`;
 const integrityFailures = failures.filter((row) => row.status === "SHA_FAILED" || row.status === "SIZE_FAILED").length;
-const clientPass = clients.every((client) => client.plannedMiB === 5120 && client.bytes === 5120 * 1024 * 1024
+const clientPass = clients.every((client) => client.plannedMiB === expectedPerClientMiB && client.bytes === expectedPerClientMiB * 1024 * 1024
   && client.passed === client.files && client.preflight === "PASS" && client.exit === "0");
 const pass = topologyValid && planBytes === expectedBytes && totalBytes === expectedBytes && uniqueCompleted === plannedFiles
   && sizesValid && hashesValid && clientPass && integrityFailures === 0 && outageValid && outageContinuity
@@ -137,12 +143,12 @@ const pass = topologyValid && planBytes === expectedBytes && totalBytes === expe
 
 const result = pass ? "PASS" : "FAIL";
 const generated = new Date().toISOString();
-const markdown = `# fknat 真实公网 50 GiB 多节点传输测试报告
+const markdown = `# fknat 真实公网 ${formatGiBLabel(expectedGiB)} 多节点传输测试报告
 
 - 结论：**${result}**
 - 运行 ID：\`${escapeMarkdown(metadata.run_id ?? path.basename(root))}\`
 - 测试时间：${formatEpoch(workloadStart)} — ${formatEpoch(workloadFinish)}（${formatDuration(workloadSeconds)}）
-- 拓扑：CA Web 经 \`129.28.42.247:4006\` FRP 暴露；Client Relay \`193.112.62.9:9000\`；Server Relay \`198.2.237.123:8820\`。${topologyTransport}
+- 拓扑：CA Web \`https://ca.fknat.top\`；193 为 Index，Client Relay 为 \`${metadata.client_relay_address ?? "198.2.237.123:9000"}\`；Server Relay \`${metadata.server_relay_address ?? "191.223.217.76:19000"}\`。${topologyTransport}
 - 端点传输模式：${endpointTransport}
 - Relay 间传输模式：${relayTransport}
 - fknat SHA-256：\`${escapeMarkdown(metadata.fknat_sha256 ?? "unknown")}\`
@@ -154,7 +160,7 @@ const markdown = `# fknat 真实公网 50 GiB 多节点传输测试报告
 |---|---:|
 | 计划有效载荷 | ${formatBytes(expectedBytes)} |
 | 已验证有效载荷 | ${formatBytes(totalBytes)} |
-| 正式拓扑断言 | ${topologyValid ? "PASS" : "FAIL"}（10 Client + 5 Server 必须全部位于本机） |
+| 正式拓扑断言 | ${topologyValid ? "PASS" : "FAIL"}（${topologyRequirement}） |
 | 成功文件 / 计划文件 | ${uniqueCompleted} / ${plannedFiles} |
 | 文件范围断言 | ${sizesValid ? "PASS" : "FAIL"}（100–200 MiB） |
 | SHA-256 断言 | ${hashesValid ? "PASS" : "FAIL"} |
@@ -168,7 +174,7 @@ const markdown = `# fknat 真实公网 50 GiB 多节点传输测试报告
 | Relay/Index 最大重启数 | ${maximumRestarts} |
 | Client 容器内存峰值 | ${formatBytes(resources.clients.maxMemoryBytes)} |
 | Server 容器内存峰值 | ${formatBytes(resources.servers.maxMemoryBytes)} |
-| 193 / 198 Relay 内存峰值 | ${formatBytes(resources.relayClientPeak)} / ${formatBytes(resources.relayServerPeak)} |
+| Client / Server Relay 内存峰值 | ${formatBytes(resources.relayClientPeak)} / ${formatBytes(resources.relayServerPeak)} |
 
 ## 测试参数与资源峰值
 
@@ -182,8 +188,9 @@ const markdown = `# fknat 真实公网 50 GiB 多节点传输测试报告
 | Client 容器 CPU / 内存峰值 | ${formatPercent(resources.clients.maxCPUPercent)} / ${formatBytes(resources.clients.maxMemoryBytes)} |
 | Server 容器 CPU / 内存峰值 | ${formatPercent(resources.servers.maxCPUPercent)} / ${formatBytes(resources.servers.maxMemoryBytes)} |
 | CA 容器 CPU / 内存峰值 | ${formatPercent(resources.ca.maxCPUPercent)} / ${formatBytes(resources.ca.maxMemoryBytes)} |
-| 193 Client Relay 内存峰值 | ${formatBytes(resources.relayClientPeak)} |
-| 198 Server Relay 内存峰值 | ${formatBytes(resources.relayServerPeak)} |
+| 193 Index 内存峰值 | ${formatBytes(resources.relayIndexPeak)} |
+| Client Relay 内存峰值 | ${formatBytes(resources.relayClientPeak)} |
+| Server Relay 内存峰值 | ${formatBytes(resources.relayServerPeak)} |
 
 ## Client 明细
 
@@ -213,7 +220,7 @@ ${billing.map((item) => `| ${item.user} | ${item.balanceBefore} | ${item.balance
 
 ## 判定规则
 
-最终 PASS 要求：10 个 Client 和 5 个 Server 容器全部部署在本机，分别经公网连接 193 Client Relay 与 198 Server Relay；总量严格等于 50 GiB；每个 Client 严格完成 5 GiB；所有正式文件为 100–200 MiB 且 SHA-256 一致；允许可恢复的网络重试，但不允许 SHA/大小完整性失败；应触发的 CA 下线均为 3–5 分钟并恢复，且每个下线窗口都有成功传输重叠；waitSubmit 最终排空；无 CA 拒绝、容器或远端服务重启。
+最终 PASS 要求：${topologyRequirement}；总量严格等于 ${formatGiBLabel(expectedGiB)}；每个 Client 严格完成 ${formatMiBLabel(expectedPerClientMiB)}；所有正式文件为 100–200 MiB 且 SHA-256 一致；允许可恢复的网络重试，但不允许 SHA/大小完整性失败；应触发的 CA 下线均为 3–5 分钟并恢复，且每个下线窗口都有成功传输重叠；waitSubmit 最终排空；无 CA 拒绝、容器或远端服务重启。
 
 报告生成时间：${generated}
 `;
@@ -225,7 +232,7 @@ fs.writeFileSync(path.join(root, "report.html"), renderHTML(markdown, {
   p50: percentile(speeds, 0.50), p95: percentile(speeds, 0.95), peak: maximumValue(speeds), integrityFailures,
   clients, outageAnalysis, expectedOutages, outageContinuity, peakQueueDepth, peakQueueBytes,
   finalQueueDepth, drainSeconds, maximumRestarts, billing, events, generated,
-  resources, configuredServerRate,
+  resources, configuredServerRate, expectedGiB,
 }), "utf8");
 fs.writeFileSync(path.join(root, "report-status.env"), `result=${result}\ntopology_valid=${topologyValid ? 1 : 0}\ncontainer_placement=${metadata.container_placement ?? "unknown"}\ntotal_bytes=${totalBytes}\nexpected_bytes=${expectedBytes}\nfiles=${uniqueCompleted}\noutages=${outageAnalysis.length}\n`, "utf8");
 process.stdout.write(`report generated result=${result} bytes=${totalBytes} files=${uniqueCompleted} outages=${outageAnalysis.length}\n`);
@@ -234,7 +241,7 @@ function renderHTML(_markdown, data) {
   const clientRows = data.clients.map((item) => `<tr><td>${h(item.client)}</td><td>${h(item.server)}</td><td>${item.plannedMiB}</td><td>${item.files}</td><td>${item.passed}</td><td>${item.attempts}</td><td>${item.retries}</td><td>${h(formatBytes(item.bytes))}</td><td>${h(item.preflight)}</td><td>${h(item.exit)}</td></tr>`).join("");
   const outageRows = data.outageAnalysis.length ? data.outageAnalysis.map((item) => `<tr><td>${h(item.sequence)}</td><td>${h(formatEpoch(number(item.scheduled_epoch)))}</td><td>${h(formatEpoch(number(item.public_unavailable_epoch)))}</td><td>${h(formatEpoch(number(item.recovered_epoch)))}</td><td>${item.actualSeconds}s</td><td>${item.overlapping}</td><td>${item.contained}</td><td>${h(item.status)}</td></tr>`).join("") : `<tr><td colspan="8">MISSING</td></tr>`;
   const billingRows = data.billing.map((item) => `<tr><td>${h(item.user)}</td><td>${item.balanceBefore}</td><td>${item.balanceAfter}</td><td>${item.userConsumedDelta}</td><td>${item.authConsumedDelta}</td><td>${item.authEarnedDelta}</td><td>${item.authorizations}</td><td>${item.certificates}</td></tr>`).join("");
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>fknat 50 GiB 真实公网测试报告</title><style>body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;margin:0;background:#f4f7fb;color:#172033}main{max-width:1180px;margin:32px auto;padding:0 20px}.hero,.card{background:#fff;border:1px solid #dbe3ef;border-radius:14px;padding:22px;margin-bottom:18px;box-shadow:0 6px 22px rgba(30,55,90,.06)}h1,h2{margin-top:0}.result{display:inline-block;padding:7px 13px;border-radius:999px;font-weight:700;background:${data.result === "PASS" ? "#d9f8e7;color:#08783f" : "#ffe0e0;color:#a11919"}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.metric{background:#f7f9fd;border-radius:10px;padding:13px}.metric b{display:block;font-size:1.15rem;margin-top:4px}table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{border-bottom:1px solid #e3e8f1;padding:9px;text-align:left;white-space:nowrap}.scroll{overflow:auto}code{word-break:break-all}.muted{color:#667085}</style></head><body><main><section class="hero"><span class="result">${h(data.result)}</span><h1>fknat 真实公网 50 GiB 多节点传输测试</h1><p class="muted">${h(formatEpoch(data.workloadStart))} — ${h(formatEpoch(data.workloadFinish))} · ${h(formatDuration(data.workloadSeconds))}</p><p>CA Web 经 129.28.42.247:4006 FRP 暴露；Client Relay 193.112.62.9:9000 → Server Relay 198.2.237.123:8820；${h(topologyTransport)}</p><p>端点传输模式：${h(endpointTransport)}<br>Relay 间传输模式：${h(relayTransport)}</p><p><code>fknat ${h(data.metadata.fknat_sha256 ?? "unknown")}</code><br><code>nodeserver ${h(data.metadata.nodeserver_sha256 ?? "unknown")}</code></p></section><section class="card"><h2>核心结果</h2><div class="grid"><div class="metric">正式拓扑<b>${data.topologyValid ? "PASS" : "FAIL"}</b></div><div class="metric">有效载荷<b>${h(formatBytes(data.totalBytes))} / ${h(formatBytes(data.expectedBytes))}</b></div><div class="metric">文件校验<b>${data.uniqueCompleted} / ${data.plannedFiles}</b></div><div class="metric">整体平均吞吐<b>${h(formatRate(data.overallBps))}</b></div><div class="metric">P50 / P95 / 峰值<b>${h(formatRate(data.p50))} / ${h(formatRate(data.p95))} / ${h(formatRate(data.peak))}</b></div><div class="metric">CA 下线<b>${data.outageAnalysis.length} / 应触发 ${data.expectedOutages}</b></div><div class="metric">waitSubmit 峰值/最终<b>${data.peakQueueDepth} / ${data.finalQueueDepth}</b></div><div class="metric">重试前失败 / 完整性失败<b>${data.failures} / ${data.integrityFailures}</b></div><div class="metric">最大服务重启<b>${data.maximumRestarts}</b></div></div></section><section class="card"><h2>测试参数与资源峰值</h2><div class="grid"><div class="metric">Server 注入上限<b>${h(data.configuredServerRate)}</b></div><div class="metric">Client CPU / 内存<b>${h(formatPercent(data.resources.clients.maxCPUPercent))} / ${h(formatBytes(data.resources.clients.maxMemoryBytes))}</b></div><div class="metric">Server CPU / 内存<b>${h(formatPercent(data.resources.servers.maxCPUPercent))} / ${h(formatBytes(data.resources.servers.maxMemoryBytes))}</b></div><div class="metric">193 Relay 内存<b>${h(formatBytes(data.resources.relayClientPeak))}</b></div><div class="metric">198 Relay 内存<b>${h(formatBytes(data.resources.relayServerPeak))}</b></div></div></section><section class="card"><h2>Client 明细</h2><div class="scroll"><table><thead><tr><th>Client</th><th>Server</th><th>计划 MiB</th><th>文件</th><th>成功</th><th>尝试</th><th>重试</th><th>接收量</th><th>预检</th><th>退出</th></tr></thead><tbody>${clientRows}</tbody></table></div></section><section class="card"><h2>CA 周期下线</h2><div class="scroll"><table><thead><tr><th>#</th><th>计划</th><th>不可用</th><th>恢复</th><th>时长</th><th>重叠文件</th><th>完全位于窗口</th><th>状态</th></tr></thead><tbody>${outageRows}</tbody></table></div></section><section class="card"><h2>计费</h2><div class="scroll"><table><thead><tr><th>用户</th><th>测试前余额</th><th>测试后余额</th><th>用户消耗增量</th><th>授权消耗增量</th><th>授权收益增量</th><th>授权数</th><th>证书数</th></tr></thead><tbody>${billingRows}</tbody></table></div></section><section class="card"><h2>协议与队列事件</h2><div class="grid"><div class="metric">KCP / TCP<b>${data.events.kcp} / ${data.events.tcp}</b></div><div class="metric">Resume / generation<b>${data.events.resume} / ${data.events.generation}</b></div><div class="metric">累计凭证提交<b>${data.events.vouchersSubmitted}</b></div><div class="metric">CA 不可达保留<b>${data.events.waitSubmitUnavailable}</b></div><div class="metric">CA 拒绝<b>${data.events.caRejected}</b></div><div class="metric">队列排空耗时<b>${data.drainSeconds}s</b></div></div></section><p class="muted">生成时间 ${h(data.generated)}。报告不包含扣费私钥、CA 管理令牌或数据库凭据。</p></main></body></html>`;
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>fknat ${h(formatGiBLabel(data.expectedGiB))} 真实公网测试报告</title><style>body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;margin:0;background:#f4f7fb;color:#172033}main{max-width:1180px;margin:32px auto;padding:0 20px}.hero,.card{background:#fff;border:1px solid #dbe3ef;border-radius:14px;padding:22px;margin-bottom:18px;box-shadow:0 6px 22px rgba(30,55,90,.06)}h1,h2{margin-top:0}.result{display:inline-block;padding:7px 13px;border-radius:999px;font-weight:700;background:${data.result === "PASS" ? "#d9f8e7;color:#08783f" : "#ffe0e0;color:#a11919"}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.metric{background:#f7f9fd;border-radius:10px;padding:13px}.metric b{display:block;font-size:1.15rem;margin-top:4px}table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{border-bottom:1px solid #e3e8f1;padding:9px;text-align:left;white-space:nowrap}.scroll{overflow:auto}code{word-break:break-all}.muted{color:#667085}</style></head><body><main><section class="hero"><span class="result">${h(data.result)}</span><h1>fknat 真实公网 ${h(formatGiBLabel(data.expectedGiB))} 多节点传输测试</h1><p class="muted">${h(formatEpoch(data.workloadStart))} — ${h(formatEpoch(data.workloadFinish))} · ${h(formatDuration(data.workloadSeconds))}</p><p>CA Web 经 129.28.42.247:4006 FRP 暴露；Index 193.112.62.9:9000 → Client Relay ${h(data.metadata.client_relay_address ?? "198.2.237.123:9000")} → Server Relay ${h(data.metadata.server_relay_address ?? "191.223.217.76:19000")}; ${h(topologyTransport)}</p><p>端点传输模式：${h(endpointTransport)}<br>Relay 间传输模式：${h(relayTransport)}</p><p><code>fknat ${h(data.metadata.fknat_sha256 ?? "unknown")}</code><br><code>nodeserver ${h(data.metadata.nodeserver_sha256 ?? "unknown")}</code></p></section><section class="card"><h2>核心结果</h2><div class="grid"><div class="metric">正式拓扑<b>${data.topologyValid ? "PASS" : "FAIL"}</b></div><div class="metric">有效载荷<b>${h(formatBytes(data.totalBytes))} / ${h(formatBytes(data.expectedBytes))}</b></div><div class="metric">文件校验<b>${data.uniqueCompleted} / ${data.plannedFiles}</b></div><div class="metric">整体平均吞吐<b>${h(formatRate(data.overallBps))}</b></div><div class="metric">P50 / P95 / 峰值<b>${h(formatRate(data.p50))} / ${h(formatRate(data.p95))} / ${h(formatRate(data.peak))}</b></div><div class="metric">CA 下线<b>${data.outageAnalysis.length} / 应触发 ${data.expectedOutages}</b></div><div class="metric">waitSubmit 峰值/最终<b>${data.peakQueueDepth} / ${data.finalQueueDepth}</b></div><div class="metric">重试前失败 / 完整性失败<b>${data.failures} / ${data.integrityFailures}</b></div><div class="metric">最大服务重启<b>${data.maximumRestarts}</b></div></div></section><section class="card"><h2>测试参数与资源峰值</h2><div class="grid"><div class="metric">Server 注入上限<b>${h(data.configuredServerRate)}</b></div><div class="metric">Client CPU / 内存<b>${h(formatPercent(data.resources.clients.maxCPUPercent))} / ${h(formatBytes(data.resources.clients.maxMemoryBytes))}</b></div><div class="metric">Server CPU / 内存<b>${h(formatPercent(data.resources.servers.maxCPUPercent))} / ${h(formatBytes(data.resources.servers.maxMemoryBytes))}</b></div><div class="metric">Client Relay 内存<b>${h(formatBytes(data.resources.relayClientPeak))}</b></div><div class="metric">Server Relay 内存<b>${h(formatBytes(data.resources.relayServerPeak))}</b></div></div></section><section class="card"><h2>Client 明细</h2><div class="scroll"><table><thead><tr><th>Client</th><th>Server</th><th>计划 MiB</th><th>文件</th><th>成功</th><th>尝试</th><th>重试</th><th>接收量</th><th>预检</th><th>退出</th></tr></thead><tbody>${clientRows}</tbody></table></div></section><section class="card"><h2>CA 周期下线</h2><div class="scroll"><table><thead><tr><th>#</th><th>计划</th><th>不可用</th><th>恢复</th><th>时长</th><th>重叠文件</th><th>完全位于窗口</th><th>状态</th></tr></thead><tbody>${outageRows}</tbody></table></div></section><section class="card"><h2>计费</h2><div class="scroll"><table><thead><tr><th>用户</th><th>测试前余额</th><th>测试后余额</th><th>用户消耗增量</th><th>授权消耗增量</th><th>授权收益增量</th><th>授权数</th><th>证书数</th></tr></thead><tbody>${billingRows}</tbody></table></div></section><section class="card"><h2>协议与队列事件</h2><div class="grid"><div class="metric">KCP / TCP<b>${data.events.kcp} / ${data.events.tcp}</b></div><div class="metric">Resume / generation<b>${data.events.resume} / ${data.events.generation}</b></div><div class="metric">累计凭证提交<b>${data.events.vouchersSubmitted}</b></div><div class="metric">CA 不可达保留<b>${data.events.waitSubmitUnavailable}</b></div><div class="metric">CA 拒绝<b>${data.events.caRejected}</b></div><div class="metric">队列排空耗时<b>${data.drainSeconds}s</b></div></div></section><p class="muted">生成时间 ${h(data.generated)}。报告不包含扣费私钥、CA 管理令牌或数据库凭据。</p></main></body></html>`;
 }
 
 function readTSV(filename) {
@@ -247,6 +254,8 @@ function readTSV(filename) {
 function readEnv(filename) { return Object.fromEntries(readText(filename).split(/\r?\n/).filter((line) => line.includes("=")).map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)])); }
 function readText(filename) { try { return fs.readFileSync(filename, "utf8"); } catch { return ""; } }
 function number(value) { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : 0; }
+function formatGiBLabel(value) { return `${Number.isInteger(value) ? value : value.toFixed(2)} GiB`; }
+function formatMiBLabel(value) { return value % 1024 === 0 ? `${value / 1024} GiB` : `${value} MiB`; }
 function sum(values, mapper) { return values.reduce((total, value) => total + mapper(value), 0); }
 function maximum(values, mapper) { return values.reduce((result, value) => Math.max(result, mapper(value)), 0); }
 function minimumValue(values) { return values.length ? values[0] : 0; }

@@ -3,6 +3,7 @@ module fknat
 go 1.25.0
 
 require (
+	github.com/klauspost/compress v1.16.7
 	github.com/wangshiben/natP2pSDK v0.0.0
 	github.com/xtaci/kcp-go/v5 v5.6.72
 )

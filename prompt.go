@@ -36,10 +36,7 @@ func completeInteractive(input io.Reader, output io.Writer, config *appConfig) e
 	if err != nil {
 		return err
 	}
-	config.CAURL, err = ask(reader, output, "CA Web API URL", config.CAURL, config.SecurityProfile == "production")
-	if err != nil {
-		return err
-	}
+	fmt.Fprintf(output, "CA Web API: %s（内置）\n", productionCAURL)
 	fmt.Fprintln(output, "扣费密钥应为 CA Web 导出的 JSON 文件；这里填写文件路径，不要粘贴私钥内容。")
 	config.BillingKeyFile, err = ask(reader, output, "扣费私钥文件", config.BillingKeyFile, config.SecurityProfile == "production")
 	if err != nil {

@@ -15,9 +15,15 @@ const resultsRoot = path.resolve(resultsRootValue);
 if (privateRoot === path.parse(privateRoot).root || resultsRoot === path.parse(resultsRoot).root) {
   throw new Error("unsafe fixture path");
 }
+const clientCount = 10;
+const totalMiB = Number.parseInt(process.env.REAL50G_TOTAL_MIB ?? "51200", 10);
+if (!Number.isSafeInteger(totalMiB) || totalMiB < clientCount * 100 || totalMiB % clientCount !== 0) {
+  throw new Error("REAL50G_TOTAL_MIB must divide evenly into 10 Client plans of at least 100 MiB");
+}
+const perClientMiB = totalMiB / clientCount;
 
 const assignments = new Map([
-  ["demo_user", Array.from({ length: 10 }, (_, index) => `client-${pad(index + 1)}`)],
+  ["demo_user", Array.from({ length: clientCount }, (_, index) => `client-${pad(index + 1)}`)],
   ["developer", Array.from({ length: 5 }, (_, index) => `server-${pad(index + 1)}`)],
   ["observer", ["index", "relay-server", "relay-client"]],
 ]);
@@ -48,9 +54,9 @@ writePrivateJSON(path.join(privateRoot, "ca", "billing-key-bootstrap.json"), man
 writeCAEnvironment(caContainer, path.join(privateRoot, "ca", "backend.env"));
 
 const planSummary = [];
-for (let client = 1; client <= 10; client += 1) {
+for (let client = 1; client <= clientCount; client += 1) {
   const name = `client-${pad(client)}`;
-  const sizes = generatePlan(5120);
+  const sizes = generatePlan(perClientMiB);
   const lines = ["file_index\tsize_mib\tvariant"];
   sizes.forEach((size, index) => {
     lines.push(`${index + 1}\t${size}\t${name}-file-${String(index + 1).padStart(3, "0")}`);
@@ -60,15 +66,15 @@ for (let client = 1; client <= 10; client += 1) {
 }
 writePublic(path.join(resultsRoot, "plan-summary.json"), `${JSON.stringify({
   version: 1,
-  total_mib: 51200,
-  total_bytes: 50 * 1024 * 1024 * 1024,
-  per_client_mib: 5120,
+  total_mib: totalMiB,
+  total_bytes: totalMiB * 1024 * 1024,
+  per_client_mib: perClientMiB,
   minimum_file_mib: 100,
   maximum_file_mib: 200,
   clients: planSummary,
 }, null, 2)}\n`);
 
-process.stdout.write(`fixture ready clients=10 servers=5 total_mib=51200 files=${planSummary.reduce((sum, item) => sum + item.files, 0)}\n`);
+process.stdout.write(`fixture ready clients=${clientCount} servers=5 total_mib=${totalMiB} files=${planSummary.reduce((sum, item) => sum + item.files, 0)}\n`);
 
 function createBundle(username) {
   const pair = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });

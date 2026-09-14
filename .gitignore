@@ -4,3 +4,10 @@
 *.log
 coverage.out
 .DS_Store
+/.private-*
+/.public-*
+/.stopped-*
+/releases/
+/current-public3h-*
+/0
+/=

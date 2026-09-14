@@ -5,7 +5,6 @@ umask 077
 
 : "${FKNAT_INDEX:?}"
 : "${FKNAT_RELAY:?}"
-: "${FKNAT_CA_URL:?}"
 : "${SERVER_NODE_ID:?}"
 : "${CLIENT_NAME:?}"
 CLIENT_LISTEN_PORT=${CLIENT_LISTEN_PORT:-18081}
@@ -26,7 +25,6 @@ trap cleanup EXIT INT TERM
   --mode client \
   --index "$FKNAT_INDEX" \
   --relay "$FKNAT_RELAY" \
-  --ca "$FKNAT_CA_URL" \
   --billing-key /state/billing-key.json \
   --identity /state/identity.key \
   --server-id "$SERVER_NODE_ID" \

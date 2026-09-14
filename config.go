@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,30 +16,39 @@ import (
 type role string
 
 const (
-	roleClient role = "client"
-	roleServer role = "server"
+	roleClient      role = "client"
+	roleServer      role = "server"
+	productionCAURL      = "https://ca.fknat.top"
 )
 
 var errHelpRequested = errors.New("help requested")
 
+func caURLForConfig(config appConfig) string {
+	if config.SecurityProfile == "development" {
+		return ""
+	}
+	return productionCAURL
+}
+
 type appConfig struct {
-	Role            role
-	IndexAddress    string
-	RelayAddress    string
-	RelayAddresses  []string
-	RelayCount      int
-	CAURL           string
-	BillingKeyFile  string
-	IdentityFile    string
-	ListenAddress   string
-	ServerNodeID    string
-	ForwardTarget   string
-	MaxSessions     int
-	AcceptQueue     int
-	DialAttempts    int
-	RetryDelay      time.Duration
-	ReconnectDelay  time.Duration
-	SecurityProfile string
+	Role                 role
+	IndexAddress         string
+	RelayAddress         string
+	RelayAddresses       []string
+	RelayCount           int
+	BillingKeyFile       string
+	IdentityFile         string
+	ListenAddress        string
+	ServerNodeID         string
+	ForwardTarget        string
+	MaxSessions          int
+	AcceptQueue          int
+	MaxStreams           int
+	MaxStreamsPerSession int
+	DialAttempts         int
+	RetryDelay           time.Duration
+	ReconnectDelay       time.Duration
+	SecurityProfile      string
 }
 
 type cliOptions struct {
@@ -61,7 +69,6 @@ func parseFlags(args []string, output io.Writer) (appConfig, cliOptions, error) 
 	flags.StringVar(&config.RelayAddress, "relay", envOrDefault("FKNAT_RELAY_ADDRESS", ""), "固定使用一个 Relay；为空则通过 Index 发现")
 	flags.StringVar(&relaysValue, "relays", envOrDefault("FKNAT_RELAY_ADDRESSES", ""), "Server 使用的多个 Relay，逗号分隔，最多三个")
 	flags.IntVar(&config.RelayCount, "relay-count", 1, "Server 自动选择的 Relay 数量，1..3")
-	flags.StringVar(&config.CAURL, "ca", envOrDefault("FKNAT_CA_URL", ""), "CA Web API URL")
 	flags.StringVar(&config.BillingKeyFile, "billing-key", envOrDefault("BNFS_BILLING_KEY_FILE", ""), "CA Web 导出的扣费私钥 JSON 文件")
 	flags.StringVar(&config.IdentityFile, "identity", envOrDefault("FKNAT_IDENTITY_FILE", ""), "节点身份私钥文件；不存在时自动创建")
 	flags.StringVar(&config.ListenAddress, "listen", envOrDefault("FKNAT_LISTEN_ADDRESS", ""), "Client 本地 TCP 监听地址；端口 0 表示随机")
@@ -69,6 +76,8 @@ func parseFlags(args []string, output io.Writer) (appConfig, cliOptions, error) 
 	flags.StringVar(&config.ForwardTarget, "target", envOrDefault("FKNAT_FORWARD_TARGET", ""), "Server 实际 TCP 应用地址 host:port")
 	flags.IntVar(&config.MaxSessions, "max-sessions", 128, "Server 最大并发 NatClient 会话数")
 	flags.IntVar(&config.AcceptQueue, "accept-queue", 128, "Server 已认证会话等待队列长度")
+	flags.IntVar(&config.MaxStreams, "max-streams", 1024, "Server 全局最大并发逻辑流数")
+	flags.IntVar(&config.MaxStreamsPerSession, "max-streams-per-session", 128, "Server 每个 NatClient 会话最大并发逻辑流数")
 	flags.IntVar(&config.DialAttempts, "dial-attempts", 12, "Client 每次建立 P2P 连接的尝试次数")
 	flags.DurationVar(&config.RetryDelay, "retry-delay", 3*time.Second, "Client 单次 P2P 拨号重试间隔")
 	flags.DurationVar(&config.ReconnectDelay, "reconnect-delay", 3*time.Second, "Client 隧道失效后的重连间隔")
@@ -109,7 +118,6 @@ func (config *appConfig) normalizeAndValidate() error {
 	}
 	config.IndexAddress = strings.TrimSpace(config.IndexAddress)
 	config.RelayAddress = strings.TrimSpace(config.RelayAddress)
-	config.CAURL = strings.TrimRight(strings.TrimSpace(config.CAURL), "/")
 	config.BillingKeyFile = strings.TrimSpace(config.BillingKeyFile)
 	config.IdentityFile = strings.TrimSpace(config.IdentityFile)
 	config.SecurityProfile = strings.ToLower(strings.TrimSpace(config.SecurityProfile))
@@ -142,14 +150,6 @@ func (config *appConfig) normalizeAndValidate() error {
 	}
 	if config.RelayCount < 1 || config.RelayCount > 3 {
 		return errors.New("--relay-count 必须在 1..3 之间")
-	}
-	if config.CAURL != "" {
-		if err := validateCAURL(config.CAURL); err != nil {
-			return err
-		}
-	}
-	if config.SecurityProfile == "production" && config.CAURL == "" {
-		return errors.New("production 安全档必须配置 CA Web API URL")
 	}
 	if config.SecurityProfile == "production" && config.BillingKeyFile == "" {
 		return errors.New("production 安全档必须配置 CA Web 导出的扣费私钥文件")
@@ -201,8 +201,8 @@ func (config *appConfig) normalizeAndValidate() error {
 		if err != nil {
 			return err
 		}
-		if config.MaxSessions < 1 || config.AcceptQueue < 1 {
-			return errors.New("--max-sessions 和 --accept-queue 必须大于 0")
+		if config.MaxSessions < 1 || config.AcceptQueue < 1 || config.MaxStreams < 1 || config.MaxStreamsPerSession < 1 {
+			return errors.New("--max-sessions、--accept-queue、--max-streams 和 --max-streams-per-session 必须大于 0")
 		}
 	}
 	return nil
@@ -271,14 +271,6 @@ func validateHostPort(value string, allowZero, allowEmptyHost bool) error {
 	port, err := strconv.Atoi(portValue)
 	if err != nil || port < 0 || port > 65535 || (!allowZero && port == 0) {
 		return fmt.Errorf("端口 %q 不在有效范围", portValue)
-	}
-	return nil
-}
-
-func validateCAURL(value string) error {
-	parsed, err := url.Parse(value)
-	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return fmt.Errorf("CA Web API URL %q 无效，必须使用 http 或 https", value)
 	}
 	return nil
 }

@@ -14,6 +14,15 @@ RUN_ID=${1:-real-50g-$(date -u +%Y%m%dT%H%M%SZ)}
 
 RESULTS_ROOT=$ROOT_DIR/test-results/$RUN_ID
 PRIVATE_ROOT=$ROOT_DIR/.private-real-50g/$RUN_ID
+RESUME_FROM_RUN=${RESUME_FROM_RUN:-}
+RESUME_RESULTS_ROOT=
+if [[ -n $RESUME_FROM_RUN ]]; then
+  [[ $RESUME_FROM_RUN =~ ^real-50g-[A-Za-z0-9_-]+$ ]] || {
+    printf 'invalid RESUME_FROM_RUN: %s\n' "$RESUME_FROM_RUN" >&2
+    exit 2
+  }
+  RESUME_RESULTS_ROOT=$ROOT_DIR/test-results/$RESUME_FROM_RUN
+fi
 KCP_BUFFER_STATE_FILE=$PRIVATE_ROOT/kcp-socket-buffers-before.env
 BIN_DIR=$ROOT_DIR/bin/real-50g
 RUN_LABEL=$RUN_ID
@@ -22,15 +31,22 @@ CONTAINER_PREFIX=fkr50-${SHORT_ID,,}
 NETWORK_NAME=$CONTAINER_PREFIX
 CA_CONTAINER=$CONTAINER_PREFIX-ca
 CA_LOCAL_URL=http://127.0.0.1:18088
-CA_PUBLIC_URL=http://129.28.42.247:4006
+CA_PUBLIC_URL=https://ca.fknat.top
 INDEX_ADDRESS=193.112.62.9:9000
-SERVER_RELAY_ADDRESS=198.2.237.123:8820
-CLIENT_RELAY_ADDRESS=193.112.62.9:9000
+SERVER_RELAY_ADDRESS=${SERVER_RELAY_ADDRESS:-198.2.237.123:8820}
+CLIENT_RELAY_ADDRESS=${CLIENT_RELAY_ADDRESS:-160.202.47.24:9000}
+CLIENT_RELAY_SSH_TARGET=${CLIENT_RELAY_SSH_TARGET:-root@160.202.47.24}
+CLIENT_RELAY_SSH_PORT=${CLIENT_RELAY_SSH_PORT:-22}
+SERVER_RELAY_SSH_TARGET=${SERVER_RELAY_SSH_TARGET:-root@198.2.237.123}
+SERVER_RELAY_SSH_PORT=${SERVER_RELAY_SSH_PORT:-30811}
+SERVER_CONTAINER_SSH_TARGET=${SERVER_CONTAINER_SSH_TARGET:-root@198.2.237.123}
+SERVER_CONTAINER_SSH_PORT=${SERVER_CONTAINER_SSH_PORT:-30811}
 DOCKER_SUBNET=10.230.65.0/24
 LOCAL_TUNNEL_ADDRESS=10.230.65.1:18820
 REMOTE_TUNNEL_ADDRESS=127.0.0.1:18820
 REMOTE_DIR=/root/fknat-real50g-$SHORT_ID
 UNIT_INDEX=fknat-real50g-${SHORT_ID}-client-index.service
+UNIT_RELAY_CLIENT=fknat-real50g-${SHORT_ID}-relay-client.service
 UNIT_RELAY_SERVER=fknat-real50g-${SHORT_ID}-relay-server.service
 UNIT_RELAY_TUNNEL=fknat-real50g-${SHORT_ID}-relay-tunnel.service
 UNIT_LOCAL_TUNNEL=fknat-real50g-${SHORT_ID}-local-tunnel.service
@@ -44,6 +60,12 @@ NFT_TABLE=fknat_real50g_${NFT_SUFFIX:0:32}
 SSH_KEY_COMMENT=fknat-real50g-$SHORT_ID
 RELAY_TCP_PATH=${RELAY_TCP_PATH:-direct}
 CONTAINER_PLACEMENT=${CONTAINER_PLACEMENT:-local}
+SERVER_CONTAINER_PLACEMENT=${SERVER_CONTAINER_PLACEMENT:-}
+CLIENT_CONTAINER_PLACEMENT=${CLIENT_CONTAINER_PLACEMENT:-}
+SERVER_COUNT=${SERVER_COUNT:-5}
+TOTAL_GIB=${TOTAL_GIB:-50}
+TOTAL_MIB=$((TOTAL_GIB * 1024))
+PER_CLIENT_MIB=$((TOTAL_MIB / 10))
 ENDPOINT_TRANSPORT=${ENDPOINT_TRANSPORT:-dual}
 ENDPOINT_SINGLE_TCP=${ENDPOINT_SINGLE_TCP:-0}
 ENDPOINT_RUNTIME_TCP_WIDTH=${ENDPOINT_RUNTIME_TCP_WIDTH:-4}
@@ -55,16 +77,23 @@ KCP_SOCKET_BUFFER_MAX=${KCP_SOCKET_BUFFER_MAX:-16777216}
 outage_pid=""
 monitor_pid=""
 relay_resource_pid=""
+monitor_dashboard_pid=""
 cleaned=0
 kcp_buffers_tuned=0
 local_rmem_max_before=""
 local_wmem_max_before=""
 relay193_rmem_max_before=""
 relay193_wmem_max_before=""
+relay160_rmem_max_before=""
+relay160_wmem_max_before=""
 relay198_rmem_max_before=""
 relay198_wmem_max_before=""
-REMOTE_DOCKER_SOCKET=/run/fkr50-${SHORT_ID:0:24}.sock
+relay_server_rmem_max_before=""
+relay_server_wmem_max_before=""
+REMOTE_DOCKER_SOCKET=/run/fkr50-${SHORT_ID:0:16}.sock
 REMOTE_DOCKER_HOST=unix://$REMOTE_DOCKER_SOCKET
+REMOTE_DOCKER_DATA_ROOT=/tmp/fkr50-${SHORT_ID:0:12}-data
+REMOTE_DOCKER_EXEC_ROOT=/tmp/fkr50-${SHORT_ID:0:12}-exec
 REMOTE_SWAP_FILE=$REMOTE_DIR/real50g.swap
 REMOTE_SWAP_BYTES=${REMOTE_SWAP_BYTES:-1073741824}
 UNIT_DOCKER_193=fknat-real50g-${SHORT_ID}-docker.service
@@ -77,6 +106,7 @@ PREFLIGHT_SIZE_MIB=${PREFLIGHT_SIZE_MIB:-16}
 PREFLIGHT_MAX_TIME_SECONDS=${PREFLIGHT_MAX_TIME_SECONDS:-300}
 CLIENT_READY_TIMEOUT_SECONDS=${CLIENT_READY_TIMEOUT_SECONDS:-$((PREFLIGHT_MAX_TIME_SECONDS + 300))}
 FILE_MAX_TIME_SECONDS=${FILE_MAX_TIME_SECONDS:-900}
+CLIENT_FILE_CONCURRENCY=${CLIENT_FILE_CONCURRENCY:-1}
 UNIT_KCP_COPY_198=fknat-real50g-${SHORT_ID}-kcp-copy.service
 DOCKER_RUNTIME_ARCHIVE=$BIN_DIR/docker-runtime.tar.gz
 BASE_IMAGE_ARCHIVE=$BIN_DIR/bnfs-local-chaos.tar.gz
@@ -91,12 +121,44 @@ case $RELAY_TCP_PATH in
     ;;
 esac
 case $CONTAINER_PLACEMENT in
-  local|relay-hosts) ;;
+  local|relay-hosts|hybrid) ;;
   *)
-    printf 'invalid CONTAINER_PLACEMENT: %s (expected local or relay-hosts)\n' "$CONTAINER_PLACEMENT" >&2
+    printf 'invalid CONTAINER_PLACEMENT: %s (expected local, relay-hosts, or hybrid)\n' "$CONTAINER_PLACEMENT" >&2
     exit 2
     ;;
 esac
+if [[ -z $SERVER_CONTAINER_PLACEMENT ]]; then
+  case $CONTAINER_PLACEMENT in
+    relay-hosts|hybrid) SERVER_CONTAINER_PLACEMENT=remote ;;
+    *) SERVER_CONTAINER_PLACEMENT=local ;;
+  esac
+fi
+if [[ -z $CLIENT_CONTAINER_PLACEMENT ]]; then
+  case $CONTAINER_PLACEMENT in
+    relay-hosts) CLIENT_CONTAINER_PLACEMENT=remote ;;
+    *) CLIENT_CONTAINER_PLACEMENT=local ;;
+  esac
+fi
+case $SERVER_CONTAINER_PLACEMENT in
+  local|remote) ;;
+  *) printf 'invalid SERVER_CONTAINER_PLACEMENT: %s (expected local or remote)\n' "$SERVER_CONTAINER_PLACEMENT" >&2; exit 2 ;;
+esac
+case $CLIENT_CONTAINER_PLACEMENT in
+  local|remote) ;;
+  *) printf 'invalid CLIENT_CONTAINER_PLACEMENT: %s (expected local or remote)\n' "$CLIENT_CONTAINER_PLACEMENT" >&2; exit 2 ;;
+esac
+[[ $SERVER_COUNT =~ ^[1-5]$ ]] || {
+  printf 'invalid SERVER_COUNT: %s (expected 1-5)\n' "$SERVER_COUNT" >&2
+  exit 2
+}
+[[ $TOTAL_GIB =~ ^[0-9]+$ ]] && ((TOTAL_GIB >= 1 && TOTAL_GIB <= 50)) || {
+  printf 'invalid TOTAL_GIB: %s (expected integer 1-50)\n' "$TOTAL_GIB" >&2
+  exit 2
+}
+((TOTAL_MIB % 10 == 0 && PER_CLIENT_MIB >= 100)) || {
+  printf 'TOTAL_GIB=%s cannot be divided into 10 valid Client plans\n' "$TOTAL_GIB" >&2
+  exit 2
+}
 case $ENDPOINT_TRANSPORT in
   dual|tcp-only) ;;
   *)
@@ -158,6 +220,10 @@ esac
   printf 'invalid FILE_MAX_TIME_SECONDS: %s (expected integer 900-86400)\n' "$FILE_MAX_TIME_SECONDS" >&2
   exit 2
 }
+[[ $CLIENT_FILE_CONCURRENCY =~ ^[1-8]$ ]] || {
+  printf 'invalid CLIENT_FILE_CONCURRENCY: %s (expected 1-8)\n' "$CLIENT_FILE_CONCURRENCY" >&2
+  exit 2
+}
 [[ $REMOTE_SWAP_BYTES =~ ^[0-9]+$ ]] && ((REMOTE_SWAP_BYTES >= 536870912)) || {
   printf 'invalid REMOTE_SWAP_BYTES: %s (expected integer >= 536870912)\n' "$REMOTE_SWAP_BYTES" >&2
   exit 2
@@ -195,15 +261,23 @@ fi
 TUNNEL_PUMP_BUF=${TUNNEL_PUMP_BUF:-1048576}
 TUNNEL_COALESCE_MS=${TUNNEL_COALESCE_MS:-250}
 TUNNEL_MAX_CHUNK=${TUNNEL_MAX_CHUNK:-65536}
-TUNNEL_STREAM_SEND_WINDOW=${TUNNEL_STREAM_SEND_WINDOW:-32}
-TUNNEL_SEND_WINDOW=${TUNNEL_SEND_WINDOW:-128}
+TUNNEL_STREAM_SEND_WINDOW=${TUNNEL_STREAM_SEND_WINDOW:-8}
+TUNNEL_SEND_WINDOW=${TUNNEL_SEND_WINDOW:-32}
 BNFS_MAX_PENDING_BILLING_DATA_SENDS=${BNFS_MAX_PENDING_BILLING_DATA_SENDS:-16}
+FKNAT_DISABLE_COMPRESSION=${FKNAT_DISABLE_COMPRESSION:-0}
+MONITOR_BIND_ADDRESS=${MONITOR_BIND_ADDRESS:-0.0.0.0}
+MONITOR_PORT=${MONITOR_PORT:-18090}
 
 if [[ -e $RESULTS_ROOT || -e $PRIVATE_ROOT ]]; then
   printf 'run path already exists: %s\n' "$RUN_ID" >&2
   exit 2
 fi
+if [[ -n $RESUME_FROM_RUN && ! -d $RESUME_RESULTS_ROOT ]]; then
+  printf 'resume source does not exist: %s\n' "$RESUME_RESULTS_ROOT" >&2
+  exit 2
+fi
 mkdir -p "$RESULTS_ROOT" "$PRIVATE_ROOT" "$BIN_DIR"
+mkdir -p "$RESULTS_ROOT/control"
 chmod 700 "$PRIVATE_ROOT"
 printf 'initializing\n' > "$RESULTS_ROOT/phase"
 
@@ -220,6 +294,58 @@ metadata() {
   printf '%s=%s\n' "$1" "$2" >> "$RESULTS_ROOT/metadata.env"
 }
 
+prepare_resume_state() {
+  [[ -n $RESUME_FROM_RUN ]] || return 0
+  local index name source_transfers pass_count pass_bytes
+  [[ -f $RESUME_RESULTS_ROOT/plan-summary.json ]] || {
+    printf 'resume source missing plan-summary.json: %s\n' "$RESUME_RESULTS_ROOT" >&2
+    return 1
+  }
+  for index in $(seq 1 10); do
+    name=client-$(printf '%02d' "$index")
+    [[ -f $RESUME_RESULTS_ROOT/plans/$name.tsv ]] || {
+      printf 'resume source missing plan: %s\n' "$name" >&2
+      return 1
+    }
+  done
+  cp "$RESUME_RESULTS_ROOT"/plans/client-*.tsv "$RESULTS_ROOT/plans/"
+  cp "$RESUME_RESULTS_ROOT/plan-summary.json" "$RESULTS_ROOT/plan-summary.json"
+  for index in $(seq 1 10); do
+    name=client-$(printf '%02d' "$index")
+    source_transfers=$RESUME_RESULTS_ROOT/$name/transfers.tsv
+    if [[ -f $source_transfers ]]; then
+      mkdir -p "$RESULTS_ROOT/$name"
+      cp "$source_transfers" "$RESULTS_ROOT/$name/transfers.tsv"
+    fi
+  done
+  read -r pass_count pass_bytes < <(node -e '
+const fs = require("node:fs");
+const path = require("node:path");
+const root = process.argv[1];
+let files = 0;
+let bytes = 0n;
+for (const name of fs.readdirSync(root).filter((entry) => /^client-\d+$/.test(entry))) {
+  const filename = path.join(root, name, "transfers.tsv");
+  if (!fs.existsSync(filename)) continue;
+  for (const line of fs.readFileSync(filename, "utf8").trim().split(/\r?\n/).slice(1)) {
+    if (!line) continue;
+    const columns = line.split("\t");
+    if (columns[14] === "PASS") {
+      files += 1;
+      bytes += BigInt(columns[4] || "0");
+    }
+  }
+}
+process.stdout.write(`${files} ${bytes}\n`);
+' "$RESUME_RESULTS_ROOT")
+  metadata resume_from_run "$RESUME_FROM_RUN"
+  metadata resume_pass_files "${pass_count:-0}"
+  metadata resume_pass_bytes "${pass_bytes:-0}"
+  printf 'source_run=%s\npass_files=%s\npass_bytes=%s\n' "$RESUME_FROM_RUN" "${pass_count:-0}" "${pass_bytes:-0}" \
+    > "$RESULTS_ROOT/resume-source.env"
+  log "resume state copied source=$RESUME_FROM_RUN pass_files=${pass_count:-0} pass_bytes=${pass_bytes:-0}"
+}
+
 json_number() {
   local key=$1 fallback=$2 value
   value=$(sed -n "s/.*\"$key\":\([0-9][0-9]*\).*/\\1/p" | head -n 1)
@@ -231,11 +357,19 @@ json_number() {
 }
 
 ssh198() {
-  ssh -o BatchMode=yes -o ConnectTimeout=10 -p 30811 root@198.2.237.123 "$@"
+  ssh -o BatchMode=yes -o ConnectTimeout=10 -p "$SERVER_CONTAINER_SSH_PORT" "$SERVER_CONTAINER_SSH_TARGET" "$@"
 }
 
 ssh193() {
   ssh -o BatchMode=yes -o ConnectTimeout=10 server4 "$@"
+}
+
+ssh_server_relay() {
+  ssh -o BatchMode=yes -o ConnectTimeout=10 -p "$SERVER_RELAY_SSH_PORT" "$SERVER_RELAY_SSH_TARGET" "$@"
+}
+
+ssh160() {
+  ssh -o BatchMode=yes -o ConnectTimeout=10 -p "$CLIENT_RELAY_SSH_PORT" "$CLIENT_RELAY_SSH_TARGET" "$@"
 }
 
 docker193() {
@@ -282,6 +416,9 @@ stop_background() {
   if [[ -z $relay_resource_pid && -f $RESULTS_ROOT/control/relay-resource-monitor.pid ]]; then
     relay_resource_pid=$(cat "$RESULTS_ROOT/control/relay-resource-monitor.pid" 2>/dev/null || true)
   fi
+  if [[ -z $monitor_dashboard_pid && -f $RESULTS_ROOT/control/monitor-dashboard.pid ]]; then
+    monitor_dashboard_pid=$(cat "$RESULTS_ROOT/control/monitor-dashboard.pid" 2>/dev/null || true)
+  fi
   if [[ -n $outage_pid ]]; then
     kill "$outage_pid" 2>/dev/null || true
     wait "$outage_pid" 2>/dev/null || true
@@ -297,6 +434,25 @@ stop_background() {
     wait "$relay_resource_pid" 2>/dev/null || true
     relay_resource_pid=""
   fi
+  if [[ -n $monitor_dashboard_pid ]]; then
+    kill "$monitor_dashboard_pid" 2>/dev/null || true
+    wait "$monitor_dashboard_pid" 2>/dev/null || true
+    monitor_dashboard_pid=""
+  fi
+}
+
+start_monitor_dashboard() {
+  if ss -lnt 2>/dev/null | awk -v port=":$MONITOR_PORT" '$4 ~ port "$" {found=1} END {exit found ? 0 : 1}'; then
+    log "monitor dashboard already listening port=$MONITOR_PORT"
+    return 0
+  fi
+  MONITOR_PORT="$MONITOR_PORT" MONITOR_BIND_ADDRESS="$MONITOR_BIND_ADDRESS" \
+    node "$SCRIPT_DIR/monitor-dashboard.mjs" "$RUN_ID" "$MONITOR_BIND_ADDRESS" "$MONITOR_PORT" \
+    > "$RESULTS_ROOT/monitor-dashboard.log" 2>&1 &
+  monitor_dashboard_pid=$!
+  printf '%s\n' "$monitor_dashboard_pid" > "$RESULTS_ROOT/control/monitor-dashboard.pid"
+  printf 'pid=%s\nport=%s\n' "$monitor_dashboard_pid" "$MONITOR_PORT" > "$RESULTS_ROOT/monitor-dashboard.env"
+  log "monitor dashboard started port=$MONITOR_PORT"
 }
 
 tune_kcp_socket_buffers() {
@@ -307,15 +463,23 @@ tune_kcp_socket_buffers() {
   local_wmem_max_before=$(sysctl -n net.core.wmem_max)
   relay193_rmem_max_before=$(ssh193 "sysctl -n net.core.rmem_max")
   relay193_wmem_max_before=$(ssh193 "sysctl -n net.core.wmem_max")
+  relay160_rmem_max_before=$(ssh160 "sysctl -n net.core.rmem_max")
+  relay160_wmem_max_before=$(ssh160 "sysctl -n net.core.wmem_max")
   relay198_rmem_max_before=$(ssh198 "sysctl -n net.core.rmem_max")
   relay198_wmem_max_before=$(ssh198 "sysctl -n net.core.wmem_max")
+  relay_server_rmem_max_before=$(ssh_server_relay "sysctl -n net.core.rmem_max")
+  relay_server_wmem_max_before=$(ssh_server_relay "sysctl -n net.core.wmem_max")
   printf '%s\n' \
     "local_rmem_max_before=$local_rmem_max_before" \
     "local_wmem_max_before=$local_wmem_max_before" \
     "relay193_rmem_max_before=$relay193_rmem_max_before" \
     "relay193_wmem_max_before=$relay193_wmem_max_before" \
+    "relay160_rmem_max_before=$relay160_rmem_max_before" \
+    "relay160_wmem_max_before=$relay160_wmem_max_before" \
     "relay198_rmem_max_before=$relay198_rmem_max_before" \
     "relay198_wmem_max_before=$relay198_wmem_max_before" \
+    "relay_server_rmem_max_before=$relay_server_rmem_max_before" \
+    "relay_server_wmem_max_before=$relay_server_wmem_max_before" \
     > "$KCP_BUFFER_STATE_FILE"
   chmod 600 "$KCP_BUFFER_STATE_FILE"
   kcp_buffers_tuned=1
@@ -323,13 +487,17 @@ tune_kcp_socket_buffers() {
   sysctl -w "net.core.rmem_max=$KCP_SOCKET_BUFFER_MAX" >/dev/null
   sysctl -w "net.core.wmem_max=$KCP_SOCKET_BUFFER_MAX" >/dev/null
   ssh193 "sysctl -w 'net.core.rmem_max=$KCP_SOCKET_BUFFER_MAX' >/dev/null; sysctl -w 'net.core.wmem_max=$KCP_SOCKET_BUFFER_MAX' >/dev/null"
+  ssh160 "sysctl -w 'net.core.rmem_max=$KCP_SOCKET_BUFFER_MAX' >/dev/null; sysctl -w 'net.core.wmem_max=$KCP_SOCKET_BUFFER_MAX' >/dev/null"
   ssh198 "sysctl -w 'net.core.rmem_max=$KCP_SOCKET_BUFFER_MAX' >/dev/null; sysctl -w 'net.core.wmem_max=$KCP_SOCKET_BUFFER_MAX' >/dev/null"
+  ssh_server_relay "sysctl -w 'net.core.rmem_max=$KCP_SOCKET_BUFFER_MAX' >/dev/null; sysctl -w 'net.core.wmem_max=$KCP_SOCKET_BUFFER_MAX' >/dev/null"
 
   metadata kcp_socket_buffer_max "$KCP_SOCKET_BUFFER_MAX"
   metadata local_rmem_max_before "$local_rmem_max_before"
   metadata local_wmem_max_before "$local_wmem_max_before"
   metadata relay193_rmem_max_before "$relay193_rmem_max_before"
   metadata relay193_wmem_max_before "$relay193_wmem_max_before"
+  metadata relay160_rmem_max_before "$relay160_rmem_max_before"
+  metadata relay160_wmem_max_before "$relay160_wmem_max_before"
   metadata relay198_rmem_max_before "$relay198_rmem_max_before"
   metadata relay198_wmem_max_before "$relay198_wmem_max_before"
   log "KCP socket buffer maxima tuned local/193/198 target=$KCP_SOCKET_BUFFER_MAX"
@@ -343,8 +511,12 @@ restore_kcp_socket_buffers() {
         local_wmem_max_before) local_wmem_max_before=$value ;;
         relay193_rmem_max_before) relay193_rmem_max_before=$value ;;
         relay193_wmem_max_before) relay193_wmem_max_before=$value ;;
+        relay160_rmem_max_before) relay160_rmem_max_before=$value ;;
+        relay160_wmem_max_before) relay160_wmem_max_before=$value ;;
         relay198_rmem_max_before) relay198_rmem_max_before=$value ;;
         relay198_wmem_max_before) relay198_wmem_max_before=$value ;;
+        relay_server_rmem_max_before) relay_server_rmem_max_before=$value ;;
+        relay_server_wmem_max_before) relay_server_wmem_max_before=$value ;;
       esac
     done < "$KCP_BUFFER_STATE_FILE"
     kcp_buffers_tuned=1
@@ -359,8 +531,14 @@ restore_kcp_socket_buffers() {
   if [[ $relay193_rmem_max_before =~ ^[0-9]+$ && $relay193_wmem_max_before =~ ^[0-9]+$ ]]; then
     ssh193 "sysctl -w 'net.core.rmem_max=$relay193_rmem_max_before' >/dev/null 2>&1 || true; sysctl -w 'net.core.wmem_max=$relay193_wmem_max_before' >/dev/null 2>&1 || true" || true
   fi
+  if [[ $relay160_rmem_max_before =~ ^[0-9]+$ && $relay160_wmem_max_before =~ ^[0-9]+$ ]]; then
+    ssh160 "sysctl -w 'net.core.rmem_max=$relay160_rmem_max_before' >/dev/null 2>&1 || true; sysctl -w 'net.core.wmem_max=$relay160_wmem_max_before' >/dev/null 2>&1 || true" || true
+  fi
   if [[ $relay198_rmem_max_before =~ ^[0-9]+$ && $relay198_wmem_max_before =~ ^[0-9]+$ ]]; then
     ssh198 "sysctl -w 'net.core.rmem_max=$relay198_rmem_max_before' >/dev/null 2>&1 || true; sysctl -w 'net.core.wmem_max=$relay198_wmem_max_before' >/dev/null 2>&1 || true" || true
+  fi
+  if [[ $relay_server_rmem_max_before =~ ^[0-9]+$ && $relay_server_wmem_max_before =~ ^[0-9]+$ ]]; then
+    ssh_server_relay "sysctl -w 'net.core.rmem_max=$relay_server_rmem_max_before' >/dev/null 2>&1 || true; sysctl -w 'net.core.wmem_max=$relay_server_wmem_max_before' >/dev/null 2>&1 || true" || true
   fi
   kcp_buffers_tuned=0
 }
@@ -370,7 +548,8 @@ collect_artifacts() {
   collect_remote_container_logs
   mkdir -p "$RESULTS_ROOT/remote"
   ssh193 "journalctl -u '$UNIT_INDEX' --no-pager -o short-iso" > "$RESULTS_ROOT/remote/relay-client-index.log" 2>&1 || true
-  ssh198 "journalctl -u '$UNIT_RELAY_SERVER' --no-pager -o short-iso" > "$RESULTS_ROOT/remote/relay-server.log" 2>&1 || true
+  ssh160 "journalctl -u '$UNIT_RELAY_CLIENT' --no-pager -o short-iso" > "$RESULTS_ROOT/remote/relay-client.log" 2>&1 || true
+  ssh_server_relay "journalctl -u '$UNIT_RELAY_SERVER' --no-pager -o short-iso" > "$RESULTS_ROOT/remote/relay-server.log" 2>&1 || true
   ssh198 "journalctl -u '$UNIT_KCP_COPY_198' --no-pager -o short-iso" > "$RESULTS_ROOT/remote/kcp-copy-deployment.log" 2>&1 || true
   if [[ $RELAY_TCP_PATH == ssh ]]; then
     nft list table ip "$NFT_TABLE" > "$RESULTS_ROOT/protocol-routing-local.nft" 2>&1 || true
@@ -379,7 +558,8 @@ collect_artifacts() {
     journalctl -u "$UNIT_LOCAL_TUNNEL" --no-pager -o short-iso > "$RESULTS_ROOT/local-tunnel.log" 2>&1 || true
   fi
   ssh193 "'$REMOTE_DIR/billingqueue-inspect' -path '$REMOTE_DIR/relay-client-index.waitsubmit'" > "$RESULTS_ROOT/remote/relay-client-index-queue-final.json" 2>/dev/null || true
-  ssh198 "'$REMOTE_DIR/billingqueue-inspect' -path '$REMOTE_DIR/relay-server.waitsubmit'" > "$RESULTS_ROOT/remote/relay-server-queue-final.json" 2>/dev/null || true
+  ssh160 "'$REMOTE_DIR/billingqueue-inspect' -path '$REMOTE_DIR/relay-client.waitsubmit'" > "$RESULTS_ROOT/remote/relay-client-queue-final.json" 2>/dev/null || true
+  ssh_server_relay "'$REMOTE_DIR/billingqueue-inspect' -path '$REMOTE_DIR/relay-server.waitsubmit'" > "$RESULTS_ROOT/remote/relay-server-queue-final.json" 2>/dev/null || true
   if [[ $CONTAINER_PLACEMENT == local ]]; then
     local name
     for name in $(docker ps -a --filter "label=fknat.real50g.run=$RUN_LABEL" --format '{{.Names}}'); do
@@ -405,7 +585,8 @@ cleanup() {
   docker rm -f "$CA_CONTAINER" >/dev/null 2>&1 || true
   docker network rm "$NETWORK_NAME" >/dev/null 2>&1 || true
   ssh193 "systemctl stop '$UNIT_INDEX' >/dev/null 2>&1 || true; systemctl reset-failed '$UNIT_INDEX' >/dev/null 2>&1 || true" || true
-  ssh198 "systemctl stop '$UNIT_RELAY_SERVER' >/dev/null 2>&1 || true; systemctl reset-failed '$UNIT_RELAY_SERVER' >/dev/null 2>&1 || true" || true
+  ssh160 "systemctl stop '$UNIT_RELAY_CLIENT' >/dev/null 2>&1 || true; systemctl reset-failed '$UNIT_RELAY_CLIENT' >/dev/null 2>&1 || true" || true
+  ssh_server_relay "systemctl stop '$UNIT_RELAY_SERVER' >/dev/null 2>&1 || true; systemctl reset-failed '$UNIT_RELAY_SERVER' >/dev/null 2>&1 || true" || true
   ssh198 "systemctl stop '$UNIT_KCP_COPY_198' >/dev/null 2>&1 || true; systemctl reset-failed '$UNIT_KCP_COPY_198' >/dev/null 2>&1 || true" || true
   ssh198 "if swapon --show=NAME --noheadings | grep -Fxq '$REMOTE_SWAP_FILE'; then swapoff '$REMOTE_SWAP_FILE' || true; fi" || true
   restore_kcp_socket_buffers
@@ -419,6 +600,7 @@ cleanup() {
   if [[ $REMOTE_DIR == /root/fknat-real50g-* ]]; then
     ssh198 "rm -rf -- '$REMOTE_DIR'" || true
     ssh193 "rm -rf -- '$REMOTE_DIR'" || true
+    ssh_server_relay "rm -rf -- '$REMOTE_DIR'" || true
   fi
   if [[ $PRIVATE_ROOT == "$ROOT_DIR/.private-real-50g/"* && $PRIVATE_ROOT != "$ROOT_DIR/.private-real-50g/" ]]; then
     rm -rf -- "$PRIVATE_ROOT"
@@ -474,7 +656,7 @@ build_artifacts() {
   gzip -9 -c "$BIN_DIR/nodeserver" > "$BIN_DIR/nodeserver.gz"
   gzip -9 -c "$BIN_DIR/billingqueue-inspect" > "$BIN_DIR/billingqueue-inspect.gz"
   gzip -9 -c "$KCP_COPY_BINARY" > "$KCP_COPY_ARCHIVE"
-  if [[ $CONTAINER_PLACEMENT == relay-hosts ]]; then
+  if [[ $SERVER_CONTAINER_PLACEMENT == remote || $CLIENT_CONTAINER_PLACEMENT == remote ]]; then
     for runtime_binary in docker dockerd containerd containerd-shim-runc-v2 runc; do
       command -v "$runtime_binary" >/dev/null
     done
@@ -492,8 +674,62 @@ build_artifacts() {
 }
 
 prepare_remote_container_runtime() {
-  [[ $CONTAINER_PLACEMENT == relay-hosts ]] || return 0
+  [[ $SERVER_CONTAINER_PLACEMENT == remote || $CLIENT_CONTAINER_PLACEMENT == remote ]] || return 0
   log "preparing temporary Docker daemons on relay hosts"
+  if [[ $CLIENT_CONTAINER_PLACEMENT != remote ]]; then
+    ssh198 "mkdir -p '$REMOTE_DIR/docker-bin' '$REMOTE_DIR/docker-data' '$REMOTE_DIR/docker-exec' '$REMOTE_DIR/containers' '$REMOTE_DIR/state' '$REMOTE_DIR/results' '$REMOTE_DIR/control'"
+    scp -q -P "$SERVER_CONTAINER_SSH_PORT" "$KCP_COPY_ARCHIVE" \
+      "$SERVER_CONTAINER_SSH_TARGET:$REMOTE_DIR/containers/"
+    ssh198 "test ! -f '$REMOTE_DIR/containers/$(basename "$KCP_COPY_ARCHIVE")' || gzip -df '$REMOTE_DIR/containers/$(basename "$KCP_COPY_ARCHIVE")'; chmod 700 '$REMOTE_DIR/containers/$(basename "$KCP_COPY_BINARY")'"
+
+    local deploy_key copy_ready=0 copy_result source filename expected actual
+    deploy_key=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+    [[ $deploy_key =~ ^[0-9a-f]{64}$ ]]
+    ssh198 systemd-run --unit="$UNIT_KCP_COPY_198" --property=KillMode=mixed --property=TimeoutStopSec=10s \
+      "$REMOTE_DIR/containers/$(basename "$KCP_COPY_BINARY")" -mode receive \
+      -address ":$KCP_COPY_PORT" -destination "$REMOTE_DIR/containers" -key-hex "$deploy_key" >/dev/null
+    for _ in $(seq 1 30); do
+      if ssh198 "ss -lun | grep -q ':$KCP_COPY_PORT '"; then
+        copy_ready=1
+        break
+      fi
+      sleep 1
+    done
+    [[ $copy_ready == 1 ]]
+    "$KCP_COPY_BINARY" -mode send -address "198.2.237.123:$KCP_COPY_PORT" -key-hex "$deploy_key" \
+      "$DOCKER_RUNTIME_ARCHIVE" "$BASE_IMAGE_ARCHIVE" "$ROOT_DIR/bin/fknat" \
+      "$BIN_DIR/httpfileserver" "$SCRIPT_DIR/server-entrypoint.sh"
+    copy_result=$(ssh198 "systemctl show '$UNIT_KCP_COPY_198' -p Result --value")
+    [[ $copy_result == success ]]
+    for source in "$DOCKER_RUNTIME_ARCHIVE" "$BASE_IMAGE_ARCHIVE" "$ROOT_DIR/bin/fknat" \
+      "$BIN_DIR/httpfileserver" "$SCRIPT_DIR/server-entrypoint.sh"; do
+      filename=$(basename "$source")
+      expected=$(sha256sum "$source" | awk '{print $1}')
+      actual=$(ssh198 "sha256sum '$REMOTE_DIR/containers/$filename'" | awk '{print $1}')
+      [[ $expected =~ ^[0-9a-f]{64}$ && $actual == "$expected" ]]
+    done
+    log "temporary runtime payload copied local->198 over authenticated KCP port=$KCP_COPY_PORT"
+
+    scp -q -P "$SERVER_CONTAINER_SSH_PORT" -r "$PRIVATE_ROOT"/server-* "$SERVER_CONTAINER_SSH_TARGET:$REMOTE_DIR/state/"
+    ssh198 "tar -xzf '$REMOTE_DIR/containers/$(basename "$DOCKER_RUNTIME_ARCHIVE")' -C '$REMOTE_DIR/docker-bin'; chmod 700 '$REMOTE_DIR/docker-bin/'* '$REMOTE_DIR/containers/fknat' '$REMOTE_DIR/containers/httpfileserver'; chmod 600 '$REMOTE_DIR/state/'*/billing-key.json"
+    ssh198 systemd-run --unit="$UNIT_DOCKER_198" --property=KillMode=mixed --property=TimeoutStopSec=20s \
+      --setenv=PATH="$REMOTE_DIR/docker-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+      "$REMOTE_DIR/docker-bin/dockerd" --host="$REMOTE_DOCKER_HOST" \
+      --data-root="$REMOTE_DOCKER_DATA_ROOT" --exec-root="$REMOTE_DOCKER_EXEC_ROOT" \
+      --pidfile="$REMOTE_DIR/docker.pid" --bridge=none --iptables=false --ip-forward=false \
+      --ip-masq=false --userland-proxy=false --log-level=error >/dev/null
+    local ready198=0
+    for _ in $(seq 1 90); do
+      docker198 info >/dev/null 2>&1 && ready198=1
+      [[ $ready198 == 1 ]] && break
+      sleep 1
+    done
+    [[ $ready198 == 1 ]]
+    docker198 load -i "$REMOTE_DIR/containers/$(basename "$BASE_IMAGE_ARCHIVE")" >/dev/null
+    docker198 image inspect "$BASE_IMAGE" >/dev/null
+    log "temporary Docker daemon ready on server container host"
+    return 0
+  fi
   ssh193 "mkdir -p '$REMOTE_DIR/docker-bin' '$REMOTE_DIR/docker-data' '$REMOTE_DIR/docker-exec' '$REMOTE_DIR/containers' '$REMOTE_DIR/state' '$REMOTE_DIR/results' '$REMOTE_DIR/plans' '$REMOTE_DIR/control'"
   ssh198 "mkdir -p '$REMOTE_DIR/docker-bin' '$REMOTE_DIR/docker-data' '$REMOTE_DIR/docker-exec' '$REMOTE_DIR/containers' '$REMOTE_DIR/state' '$REMOTE_DIR/results' '$REMOTE_DIR/control'"
   ssh198 "fallocate -l '$REMOTE_SWAP_BYTES' '$REMOTE_SWAP_FILE'; chmod 600 '$REMOTE_SWAP_FILE'; mkswap '$REMOTE_SWAP_FILE' >/dev/null; swapon '$REMOTE_SWAP_FILE'"
@@ -544,13 +780,13 @@ prepare_remote_container_runtime() {
   ssh193 systemd-run --unit="$UNIT_DOCKER_193" --property=KillMode=mixed --property=TimeoutStopSec=20s \
     --setenv=PATH="$REMOTE_DIR/docker-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     "$REMOTE_DIR/docker-bin/dockerd" --host="$REMOTE_DOCKER_HOST" \
-    --data-root="$REMOTE_DIR/docker-data" --exec-root="$REMOTE_DIR/docker-exec" \
+    --data-root="$REMOTE_DOCKER_DATA_ROOT" --exec-root="$REMOTE_DOCKER_EXEC_ROOT" \
     --pidfile="$REMOTE_DIR/docker.pid" --bridge=none --iptables=false --ip-forward=false \
     --ip-masq=false --userland-proxy=false --log-level=error >/dev/null
   ssh198 systemd-run --unit="$UNIT_DOCKER_198" --property=KillMode=mixed --property=TimeoutStopSec=20s \
     --setenv=PATH="$REMOTE_DIR/docker-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     "$REMOTE_DIR/docker-bin/dockerd" --host="$REMOTE_DOCKER_HOST" \
-    --data-root="$REMOTE_DIR/docker-data" --exec-root="$REMOTE_DIR/docker-exec" \
+    --data-root="$REMOTE_DOCKER_DATA_ROOT" --exec-root="$REMOTE_DOCKER_EXEC_ROOT" \
     --pidfile="$REMOTE_DIR/docker.pid" --bridge=none --iptables=false --ip-forward=false \
     --ip-masq=false --userland-proxy=false --log-level=error >/dev/null
 
@@ -570,37 +806,51 @@ prepare_remote_container_runtime() {
 }
 
 sync_remote_container_results() {
-  [[ $CONTAINER_PLACEMENT == relay-hosts ]] || return 0
+  [[ $SERVER_CONTAINER_PLACEMENT == remote || $CLIENT_CONTAINER_PLACEMENT == remote ]] || return 0
   mkdir -p "$RESULTS_ROOT"
-  ssh193 "tar -C '$REMOTE_DIR/results' --ignore-failed-read --exclude='*/current.bin' --exclude='*/current.metrics' --exclude='*/current.error' -czf - ." 2>/dev/null | tar -C "$RESULTS_ROOT" -xzf - 2>/dev/null || true
-  ssh198 "tar -C '$REMOTE_DIR/results' --ignore-failed-read --exclude='*/current.bin' --exclude='*/current.metrics' --exclude='*/current.error' -czf - ." 2>/dev/null | tar -C "$RESULTS_ROOT" -xzf - 2>/dev/null || true
+  if [[ $CLIENT_CONTAINER_PLACEMENT == remote ]]; then
+    ssh193 "tar -C '$REMOTE_DIR/results' --ignore-failed-read --exclude='*/current.bin' --exclude='*/current.metrics' --exclude='*/current.error' -czf - ." 2>/dev/null | tar -C "$RESULTS_ROOT" -xzf - 2>/dev/null || true
+  fi
+  if [[ $SERVER_CONTAINER_PLACEMENT == remote ]]; then
+    ssh198 "tar -C '$REMOTE_DIR/results' --ignore-failed-read --exclude='*/current.bin' --exclude='*/current.metrics' --exclude='*/current.error' -czf - ." 2>/dev/null | tar -C "$RESULTS_ROOT" -xzf - 2>/dev/null || true
+  fi
 }
 
 collect_remote_container_logs() {
-  [[ $CONTAINER_PLACEMENT == relay-hosts ]] || return 0
+  [[ $SERVER_CONTAINER_PLACEMENT == remote || $CLIENT_CONTAINER_PLACEMENT == remote ]] || return 0
   local name
-  for name in $(docker193 ps -a --filter "label=fknat.real50g.run=$RUN_LABEL" --format '{{.Names}}' 2>/dev/null); do
-    docker193 logs "$name" > "$RESULTS_ROOT/${name}.docker.log" 2>&1 || true
-  done
-  for name in $(docker198 ps -a --filter "label=fknat.real50g.run=$RUN_LABEL" --format '{{.Names}}' 2>/dev/null); do
-    docker198 logs "$name" > "$RESULTS_ROOT/${name}.docker.log" 2>&1 || true
-  done
+  if [[ $CLIENT_CONTAINER_PLACEMENT == remote ]]; then
+    for name in $(docker193 ps -a --filter "label=fknat.real50g.run=$RUN_LABEL" --format '{{.Names}}' 2>/dev/null); do
+      docker193 logs "$name" > "$RESULTS_ROOT/${name}.docker.log" 2>&1 || true
+    done
+  fi
+  if [[ $SERVER_CONTAINER_PLACEMENT == remote ]]; then
+    for name in $(docker198 ps -a --filter "label=fknat.real50g.run=$RUN_LABEL" --format '{{.Names}}' 2>/dev/null); do
+      docker198 logs "$name" > "$RESULTS_ROOT/${name}.docker.log" 2>&1 || true
+    done
+  fi
 }
 
 stop_remote_container_runtime() {
-  [[ $CONTAINER_PLACEMENT == relay-hosts ]] || return 0
+  [[ $SERVER_CONTAINER_PLACEMENT == remote || $CLIENT_CONTAINER_PLACEMENT == remote ]] || return 0
   local containers
-  containers=$(docker193 ps -aq --filter "label=fknat.real50g.run=$RUN_LABEL" 2>/dev/null || true)
-  [[ -z $containers ]] || docker193 rm -f $containers >/dev/null 2>&1 || true
-  containers=$(docker198 ps -aq --filter "label=fknat.real50g.run=$RUN_LABEL" 2>/dev/null || true)
-  [[ -z $containers ]] || docker198 rm -f $containers >/dev/null 2>&1 || true
-  ssh193 "systemctl stop '$UNIT_DOCKER_193' >/dev/null 2>&1 || true; systemctl reset-failed '$UNIT_DOCKER_193' >/dev/null 2>&1 || true; find /run -maxdepth 1 -type s -name '$(basename "$REMOTE_DOCKER_SOCKET")' -delete 2>/dev/null || true; if mountpoint -q '$REMOTE_DIR/docker-exec/netns/default'; then umount '$REMOTE_DIR/docker-exec/netns/default' || true; fi" || true
-  ssh198 "systemctl stop '$UNIT_DOCKER_198' >/dev/null 2>&1 || true; systemctl reset-failed '$UNIT_DOCKER_198' >/dev/null 2>&1 || true; find /run -maxdepth 1 -type s -name '$(basename "$REMOTE_DOCKER_SOCKET")' -delete 2>/dev/null || true; if mountpoint -q '$REMOTE_DIR/docker-exec/netns/default'; then umount '$REMOTE_DIR/docker-exec/netns/default' || true; fi" || true
+  if [[ $CLIENT_CONTAINER_PLACEMENT == remote ]]; then
+    containers=$(docker193 ps -aq --filter "label=fknat.real50g.run=$RUN_LABEL" 2>/dev/null || true)
+    [[ -z $containers ]] || docker193 rm -f $containers >/dev/null 2>&1 || true
+    ssh193 "systemctl stop '$UNIT_DOCKER_193' >/dev/null 2>&1 || true; systemctl reset-failed '$UNIT_DOCKER_193' >/dev/null 2>&1 || true; find /run -maxdepth 1 -type s -name '$(basename "$REMOTE_DOCKER_SOCKET")' -delete 2>/dev/null || true; if mountpoint -q '$REMOTE_DOCKER_EXEC_ROOT/netns/default'; then umount '$REMOTE_DOCKER_EXEC_ROOT/netns/default' || true; fi" || true
+  fi
+  if [[ $SERVER_CONTAINER_PLACEMENT == remote ]]; then
+    containers=$(docker198 ps -aq --filter "label=fknat.real50g.run=$RUN_LABEL" 2>/dev/null || true)
+    [[ -z $containers ]] || docker198 rm -f $containers >/dev/null 2>&1 || true
+    ssh198 "systemctl stop '$UNIT_DOCKER_198' >/dev/null 2>&1 || true; systemctl reset-failed '$UNIT_DOCKER_198' >/dev/null 2>&1 || true; find /run -maxdepth 1 -type s -name '$(basename "$REMOTE_DOCKER_SOCKET")' -delete 2>/dev/null || true; if mountpoint -q '$REMOTE_DOCKER_EXEC_ROOT/netns/default'; then umount '$REMOTE_DOCKER_EXEC_ROOT/netns/default' || true; fi" || true
+  fi
 }
 
 prepare_fixture_and_ca() {
   phase ca-bootstrap
-  node "$SCRIPT_DIR/generate-fixture.mjs" "$PRIVATE_ROOT" "$RESULTS_ROOT" "$MAIN_CA_CONTAINER"
+  REAL50G_TOTAL_MIB="$TOTAL_MIB" \
+    node "$SCRIPT_DIR/generate-fixture.mjs" "$PRIVATE_ROOT" "$RESULTS_ROOT" "$MAIN_CA_CONTAINER"
+  prepare_resume_state
   if [[ $RELAY_TCP_PATH == ssh ]]; then
     ssh-keygen -q -t ed25519 -N '' -C "$SSH_KEY_COMMENT" -f "$PRIVATE_ROOT/relay-tunnel.key"
     ssh-keyscan -T 10 -p 30811 198.2.237.123 > "$PRIVATE_ROOT/relay-tunnel.known_hosts" 2>/dev/null
@@ -629,26 +879,115 @@ prepare_fixture_and_ca() {
 
 deploy_remote_nodes() {
   phase remote-deploy
+  if [[ $SERVER_RELAY_SSH_TARGET != $SERVER_CONTAINER_SSH_TARGET || $SERVER_RELAY_SSH_PORT != $SERVER_CONTAINER_SSH_PORT || $CLIENT_RELAY_SSH_TARGET != $SERVER_CONTAINER_SSH_TARGET || $CLIENT_RELAY_SSH_PORT != $SERVER_CONTAINER_SSH_PORT ]]; then
+    [[ $RELAY_TCP_PATH == direct ]] || {
+      log "split relay deployment requires RELAY_TCP_PATH=direct"
+      return 1
+    }
+    local relay_target client_target server_target
+    relay_target=$SERVER_RELAY_SSH_TARGET
+    client_target=$CLIENT_RELAY_SSH_TARGET
+    server_target=$SERVER_CONTAINER_SSH_TARGET
+    ssh193 "mkdir -p '$REMOTE_DIR/logs'; chmod 700 '$REMOTE_DIR'"
+    ssh_server_relay "mkdir -p '$REMOTE_DIR/logs'; chmod 700 '$REMOTE_DIR'"
+    ssh160 "mkdir -p '$REMOTE_DIR/logs'; chmod 700 '$REMOTE_DIR'"
+    ssh198 "mkdir -p '$REMOTE_DIR/logs'; chmod 700 '$REMOTE_DIR'"
+    scp -q "$BIN_DIR/nodeserver.gz" "$BIN_DIR/billingqueue-inspect.gz" "$PRIVATE_ROOT/index/billing-key.json" "server4:$REMOTE_DIR/"
+    scp -q -P "$SERVER_RELAY_SSH_PORT" "$BIN_DIR/nodeserver.gz" "$BIN_DIR/billingqueue-inspect.gz" "$PRIVATE_ROOT/index/billing-key.json" "$relay_target:$REMOTE_DIR/"
+    scp -q -P "$CLIENT_RELAY_SSH_PORT" "$BIN_DIR/nodeserver.gz" "$BIN_DIR/billingqueue-inspect.gz" "$PRIVATE_ROOT/index/billing-key.json" "$client_target:$REMOTE_DIR/"
+    if [[ $CLIENT_RELAY_SSH_TARGET != "$SERVER_CONTAINER_SSH_TARGET" || $CLIENT_RELAY_SSH_PORT != "$SERVER_CONTAINER_SSH_PORT" ]]; then
+      scp -q -P "$SERVER_CONTAINER_SSH_PORT" "$BIN_DIR/nodeserver.gz" "$BIN_DIR/billingqueue-inspect.gz" "$PRIVATE_ROOT/index/billing-key.json" "$server_target:$REMOTE_DIR/"
+    fi
+    ssh193 "test ! -f '$REMOTE_DIR/nodeserver.gz' || gzip -df '$REMOTE_DIR/nodeserver.gz'; test ! -f '$REMOTE_DIR/billingqueue-inspect.gz' || gzip -df '$REMOTE_DIR/billingqueue-inspect.gz'; chmod 700 '$REMOTE_DIR/nodeserver' '$REMOTE_DIR/billingqueue-inspect'; chmod 600 '$REMOTE_DIR/billing-key.json'"
+    ssh_server_relay "test ! -f '$REMOTE_DIR/nodeserver.gz' || gzip -df '$REMOTE_DIR/nodeserver.gz'; test ! -f '$REMOTE_DIR/billingqueue-inspect.gz' || gzip -df '$REMOTE_DIR/billingqueue-inspect.gz'; chmod 700 '$REMOTE_DIR/nodeserver' '$REMOTE_DIR/billingqueue-inspect'; chmod 600 '$REMOTE_DIR/billing-key.json'"
+    ssh160 "test ! -f '$REMOTE_DIR/nodeserver.gz' || gzip -df '$REMOTE_DIR/nodeserver.gz'; test ! -f '$REMOTE_DIR/billingqueue-inspect.gz' || gzip -df '$REMOTE_DIR/billingqueue-inspect.gz'; chmod 700 '$REMOTE_DIR/nodeserver' '$REMOTE_DIR/billingqueue-inspect'; chmod 600 '$REMOTE_DIR/billing-key.json'"
+    ssh198 "test ! -f '$REMOTE_DIR/nodeserver.gz' || gzip -df '$REMOTE_DIR/nodeserver.gz'; test ! -f '$REMOTE_DIR/billingqueue-inspect.gz' || gzip -df '$REMOTE_DIR/billingqueue-inspect.gz'; chmod 700 '$REMOTE_DIR/nodeserver' '$REMOTE_DIR/billingqueue-inspect'; chmod 600 '$REMOTE_DIR/billing-key.json'"
+    for host_cmd in \
+      "ssh198 curl -fsS --max-time 15 '$CA_PUBLIC_URL/readyz' >/dev/null" \
+      "ssh193 curl -fsS --max-time 15 '$CA_PUBLIC_URL/readyz' >/dev/null" \
+      "ssh160 curl -fsS --max-time 15 '$CA_PUBLIC_URL/readyz' >/dev/null" \
+      "ssh_server_relay curl -fsS --max-time 15 '$CA_PUBLIC_URL/readyz' >/dev/null"; do
+      eval "$host_cmd"
+    done
+
+    ssh193 systemd-run --unit="$UNIT_INDEX" --property=Restart=on-failure --property=RestartSec=3s \
+      --setenv=BNFS_BILLING_KEY_FILE="$REMOTE_DIR/billing-key.json" \
+      --setenv=BNFS_SECURITY_PROFILE=production --setenv=BNFS_LOG_LEVEL=info \
+      --setenv=BNFS_REVOCATION_STATE_FILE="$REMOTE_DIR/relay-client-index.revocations.json" \
+      --setenv=BNFS_LOG_CONSOLE=true --setenv=BNFS_LOG_DIRECTORY="$REMOTE_DIR/logs/relay-client-index" \
+      --setenv=BNFS_DISABLE_KCP="$RELAY_DISABLE_KCP" --setenv=BNFS_BRIDGE_KCP="$RELAY_BRIDGE_KCP" \
+      --setenv=BNFS_KCP_SEND_WINDOW=1536 --setenv=BNFS_KCP_RECEIVE_WINDOW=6144 \
+      --setenv=BNFS_KCP_SESSION_BUFFER_BYTES=16777216 \
+      "$REMOTE_DIR/nodeserver" -mode relay -listen :9000 -public "$INDEX_ADDRESS" \
+      -peer "$SERVER_RELAY_ADDRESS" -ca "$CA_PUBLIC_URL" -bridge-width "$RELAY_BRIDGE_WIDTH" \
+      -admission enforce -key "$REMOTE_DIR/relay-client-index.identity" \
+      -billing-queue "$REMOTE_DIR/relay-client-index.waitsubmit" >/dev/null
+    wait_tcp "${INDEX_ADDRESS%:*}" "${INDEX_ADDRESS##*:}" 90
+
+    ssh160 systemd-run --unit="$UNIT_RELAY_CLIENT" --property=Restart=on-failure --property=RestartSec=3s \
+      --setenv=BNFS_BILLING_KEY_FILE="$REMOTE_DIR/billing-key.json" \
+      --setenv=BNFS_SECURITY_PROFILE=production --setenv=BNFS_LOG_LEVEL=info \
+      --setenv=BNFS_REVOCATION_STATE_FILE="$REMOTE_DIR/relay-client.revocations.json" \
+      --setenv=BNFS_LOG_CONSOLE=true --setenv=BNFS_LOG_DIRECTORY="$REMOTE_DIR/logs/relay-client" \
+      --setenv=BNFS_DISABLE_KCP="$RELAY_DISABLE_KCP" --setenv=BNFS_BRIDGE_KCP="$RELAY_BRIDGE_KCP" \
+      --setenv=BNFS_KCP_SEND_WINDOW=1536 --setenv=BNFS_KCP_RECEIVE_WINDOW=6144 \
+      --setenv=BNFS_KCP_SESSION_BUFFER_BYTES=16777216 \
+      "$REMOTE_DIR/nodeserver" -mode relay -listen :9000 -public "$CLIENT_RELAY_ADDRESS" \
+      -peer "$SERVER_RELAY_ADDRESS" -ca "$CA_PUBLIC_URL" -bridge-width "$RELAY_BRIDGE_WIDTH" \
+      -admission enforce -key "$REMOTE_DIR/relay-client.identity" \
+      -billing-queue "$REMOTE_DIR/relay-client.waitsubmit" >/dev/null
+    wait_tcp "${CLIENT_RELAY_ADDRESS%:*}" "${CLIENT_RELAY_ADDRESS##*:}" 90
+
+    ssh_server_relay systemd-run --unit="$UNIT_RELAY_SERVER" --property=Restart=on-failure --property=RestartSec=3s \
+      --setenv=BNFS_BILLING_KEY_FILE="$REMOTE_DIR/billing-key.json" \
+      --setenv=BNFS_SECURITY_PROFILE=production --setenv=BNFS_LOG_LEVEL=info \
+      --setenv=BNFS_REVOCATION_STATE_FILE="$REMOTE_DIR/relay-server.revocations.json" \
+      --setenv=BNFS_LOG_CONSOLE=true --setenv=BNFS_LOG_DIRECTORY="$REMOTE_DIR/logs/relay-server" \
+      --setenv=BNFS_DISABLE_KCP="$RELAY_DISABLE_KCP" --setenv=BNFS_BRIDGE_KCP="$RELAY_BRIDGE_KCP" \
+      --setenv=BNFS_KCP_SEND_WINDOW=1536 --setenv=BNFS_KCP_RECEIVE_WINDOW=6144 \
+      --setenv=BNFS_KCP_SESSION_BUFFER_BYTES=16777216 \
+      "$REMOTE_DIR/nodeserver" -mode relay -listen ":${SERVER_RELAY_ADDRESS##*:}" -public "$SERVER_RELAY_ADDRESS" \
+      -index "$INDEX_ADDRESS" -ca "$CA_PUBLIC_URL" -admission enforce -bridge-width "$RELAY_BRIDGE_WIDTH" \
+      -key "$REMOTE_DIR/relay-server.identity" -billing-queue "$REMOTE_DIR/relay-server.waitsubmit" >/dev/null
+    wait_tcp "${SERVER_RELAY_ADDRESS%:*}" "${SERVER_RELAY_ADDRESS##*:}" 90
+    for _ in $(seq 1 60); do
+      if ssh193 "journalctl -u '$UNIT_INDEX' --no-pager | grep -q '控制链路已建立(主动).*${SERVER_RELAY_ADDRESS//./\\.}'"; then
+        break
+      fi
+      sleep 2
+    done
+    ssh193 "systemctl is-active '$UNIT_INDEX'"
+    ssh160 "systemctl is-active '$UNIT_RELAY_CLIENT'; ss -lun | grep -q ':${CLIENT_RELAY_ADDRESS##*:} '; ss -lnt | grep -q ':${CLIENT_RELAY_ADDRESS##*:} '"
+    ssh_server_relay "systemctl is-active '$UNIT_RELAY_SERVER'; ss -lun | grep -q ':${SERVER_RELAY_ADDRESS##*:} '; ss -lnt | grep -q ':${SERVER_RELAY_ADDRESS##*:} '"
+    log "split relays ready index=$INDEX_ADDRESS client=$CLIENT_RELAY_ADDRESS server=$SERVER_RELAY_ADDRESS"
+    return 0
+  fi
   ssh198 "mkdir -p '$REMOTE_DIR/logs'; chmod 700 '$REMOTE_DIR'"
   ssh193 "mkdir -p '$REMOTE_DIR/logs'; chmod 700 '$REMOTE_DIR'"
+  ssh160 "mkdir -p '$REMOTE_DIR/logs'; chmod 700 '$REMOTE_DIR'"
   scp -q -P 30811 "$BIN_DIR/nodeserver.gz" "$BIN_DIR/billingqueue-inspect.gz" \
     "$PRIVATE_ROOT/index/billing-key.json" "root@198.2.237.123:$REMOTE_DIR/"
   scp -q "$BIN_DIR/nodeserver.gz" "$BIN_DIR/billingqueue-inspect.gz" \
     "$PRIVATE_ROOT/index/billing-key.json" "server4:$REMOTE_DIR/"
+  scp -q -P "$CLIENT_RELAY_SSH_PORT" "$BIN_DIR/nodeserver.gz" "$BIN_DIR/billingqueue-inspect.gz" \
+    "$PRIVATE_ROOT/index/billing-key.json" "$CLIENT_RELAY_SSH_TARGET:$REMOTE_DIR/"
   if [[ $RELAY_TCP_PATH == ssh ]]; then
     scp -q -P 30811 "$PRIVATE_ROOT/relay-tunnel.key.pub" "root@198.2.237.123:$REMOTE_DIR/"
     scp -q "$PRIVATE_ROOT/relay-tunnel.key" "$PRIVATE_ROOT/relay-tunnel.known_hosts" "server4:$REMOTE_DIR/"
   fi
   ssh198 "gzip -df '$REMOTE_DIR/nodeserver.gz' '$REMOTE_DIR/billingqueue-inspect.gz'"
   ssh193 "gzip -df '$REMOTE_DIR/nodeserver.gz' '$REMOTE_DIR/billingqueue-inspect.gz'"
+  ssh160 "gzip -df '$REMOTE_DIR/nodeserver.gz' '$REMOTE_DIR/billingqueue-inspect.gz'"
   ssh198 "chmod 700 '$REMOTE_DIR/nodeserver' '$REMOTE_DIR/billingqueue-inspect'; chmod 600 '$REMOTE_DIR/billing-key.json'"
   ssh193 "chmod 700 '$REMOTE_DIR/nodeserver' '$REMOTE_DIR/billingqueue-inspect'; chmod 600 '$REMOTE_DIR/billing-key.json'"
+  ssh160 "chmod 700 '$REMOTE_DIR/nodeserver' '$REMOTE_DIR/billingqueue-inspect'; chmod 600 '$REMOTE_DIR/billing-key.json'"
   if [[ $RELAY_TCP_PATH == ssh ]]; then
     ssh198 "install -d -m 700 /root/.ssh; touch /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys; if ! grep -Fq ' $SSH_KEY_COMMENT' /root/.ssh/authorized_keys; then printf '%s ' 'no-agent-forwarding,no-X11-forwarding,no-pty,permitopen=\"127.0.0.1:8820\"' >> /root/.ssh/authorized_keys; cat '$REMOTE_DIR/relay-tunnel.key.pub' >> /root/.ssh/authorized_keys; fi"
     ssh193 "chmod 600 '$REMOTE_DIR/relay-tunnel.key' '$REMOTE_DIR/relay-tunnel.known_hosts'"
   fi
   ssh198 "curl -fsS --max-time 15 '$CA_PUBLIC_URL/readyz' >/dev/null"
   ssh193 "curl -fsS --max-time 15 '$CA_PUBLIC_URL/readyz' >/dev/null"
+  ssh160 "curl -fsS --max-time 15 '$CA_PUBLIC_URL/readyz' >/dev/null"
 
   ssh193 systemd-run --unit="$UNIT_INDEX" --property=Restart=on-failure --property=RestartSec=3s \
     --setenv=BNFS_BILLING_KEY_FILE="$REMOTE_DIR/billing-key.json" \
@@ -659,12 +998,28 @@ deploy_remote_nodes() {
     --setenv=BNFS_BRIDGE_KCP="$RELAY_BRIDGE_KCP" \
     --setenv=BNFS_KCP_SEND_WINDOW=1536 --setenv=BNFS_KCP_RECEIVE_WINDOW=6144 \
     --setenv=BNFS_KCP_SESSION_BUFFER_BYTES=16777216 \
-    "$REMOTE_DIR/nodeserver" -mode relay -listen :9000 -public 193.112.62.9:9000 \
+    "$REMOTE_DIR/nodeserver" -mode relay -listen :9000 -public "$INDEX_ADDRESS" \
     -peer "$SERVER_RELAY_ADDRESS" -ca "$CA_PUBLIC_URL" \
     -bridge-width "$RELAY_BRIDGE_WIDTH" \
     -admission enforce -key "$REMOTE_DIR/relay-client-index.identity" \
     -billing-queue "$REMOTE_DIR/relay-client-index.waitsubmit" >/dev/null
   wait_tcp 193.112.62.9 9000 90
+
+  ssh160 systemd-run --unit="$UNIT_RELAY_CLIENT" --property=Restart=on-failure --property=RestartSec=3s \
+    --setenv=BNFS_BILLING_KEY_FILE="$REMOTE_DIR/billing-key.json" \
+    --setenv=BNFS_SECURITY_PROFILE=production --setenv=BNFS_LOG_LEVEL=info \
+    --setenv=BNFS_REVOCATION_STATE_FILE="$REMOTE_DIR/relay-client.revocations.json" \
+    --setenv=BNFS_LOG_CONSOLE=true --setenv=BNFS_LOG_DIRECTORY="$REMOTE_DIR/logs/relay-client" \
+    --setenv=BNFS_DISABLE_KCP="$RELAY_DISABLE_KCP" \
+    --setenv=BNFS_BRIDGE_KCP="$RELAY_BRIDGE_KCP" \
+    --setenv=BNFS_KCP_SEND_WINDOW=1536 --setenv=BNFS_KCP_RECEIVE_WINDOW=6144 \
+    --setenv=BNFS_KCP_SESSION_BUFFER_BYTES=16777216 \
+    "$REMOTE_DIR/nodeserver" -mode relay -listen :9000 -public "$CLIENT_RELAY_ADDRESS" \
+    -peer "$SERVER_RELAY_ADDRESS" -ca "$CA_PUBLIC_URL" \
+    -bridge-width "$RELAY_BRIDGE_WIDTH" \
+    -admission enforce -key "$REMOTE_DIR/relay-client.identity" \
+    -billing-queue "$REMOTE_DIR/relay-client.waitsubmit" >/dev/null
+  wait_tcp "${CLIENT_RELAY_ADDRESS%:*}" "${CLIENT_RELAY_ADDRESS##*:}" 90
 
   ssh198 systemd-run --unit="$UNIT_RELAY_SERVER" --property=Restart=on-failure --property=RestartSec=3s \
     --setenv=BNFS_BILLING_KEY_FILE="$REMOTE_DIR/billing-key.json" \
@@ -703,6 +1058,7 @@ deploy_remote_nodes() {
   [[ $peer_ready == 1 ]]
   sleep 3
   ssh193 "systemctl is-active '$UNIT_INDEX'"
+  ssh160 "systemctl is-active '$UNIT_RELAY_CLIENT'; ss -lun | grep -q ':9000 '; ss -lnt | grep -q ':9000 '"
   ssh198 "systemctl is-active '$UNIT_RELAY_SERVER'; ss -lun | grep -q ':8820 '; ss -lnt | grep -q ':8820 '"
   if [[ $RELAY_TCP_PATH == ssh ]]; then
     ssh193 "systemctl is-active '$UNIT_RELAY_TUNNEL'; ss -lnt | grep -q ':18820 '"
@@ -730,9 +1086,9 @@ docker_common_arguments() {
     -e BNFS_KCP_RECEIVE_WINDOW=6144 \
     -e BNFS_KCP_SESSION_BUFFER_BYTES=16777216 \
     -e "BNFS_MAX_PENDING_BILLING_DATA_SENDS=$BNFS_MAX_PENDING_BILLING_DATA_SENDS" \
+    -e "FKNAT_DISABLE_COMPRESSION=$FKNAT_DISABLE_COMPRESSION" \
     -e "BNFS_DISABLE_KCP=$disable_kcp" \
-    -e "FKNAT_INDEX=$INDEX_ADDRESS" \
-    -e "FKNAT_CA_URL=$CA_PUBLIC_URL"
+    -e "FKNAT_INDEX=$INDEX_ADDRESS"
 }
 
 remote_docker_common_arguments() {
@@ -756,21 +1112,21 @@ remote_docker_common_arguments() {
     -e BNFS_KCP_RECEIVE_WINDOW=6144 \
     -e BNFS_KCP_SESSION_BUFFER_BYTES=16777216 \
     -e "BNFS_MAX_PENDING_BILLING_DATA_SENDS=$BNFS_MAX_PENDING_BILLING_DATA_SENDS" \
-    -e "BNFS_DISABLE_KCP=$disable_kcp" \
-    -e "FKNAT_CA_URL=$CA_PUBLIC_URL"
+    -e "FKNAT_DISABLE_COMPRESSION=$FKNAT_DISABLE_COMPRESSION" \
+    -e "BNFS_DISABLE_KCP=$disable_kcp"
 }
 
 start_remote_servers() {
   printf 'server\tnode_id\tcontainer\n' > "$RESULTS_ROOT/server-nodes.tsv"
   local index name container node_id app_port ready
-  for index in $(seq 1 5); do
+  for index in $(seq 1 "$SERVER_COUNT"); do
     name=server-$(printf '%02d' "$index")
     container=$CONTAINER_PREFIX-$name
     app_port=$((15172 + index))
     ssh198 "mkdir -p '$REMOTE_DIR/results/$name/sdk-logs'"
     mapfile -t common < <(remote_docker_common_arguments)
     docker198 run -d --name "$container" "${common[@]}" \
-      -e "SERVER_NAME=$name" -e FKNAT_INDEX="$INDEX_ADDRESS" -e FKNAT_RELAY=127.0.0.1:8820 \
+      -e "SERVER_NAME=$name" -e FKNAT_INDEX="$INDEX_ADDRESS" -e FKNAT_RELAY="$SERVER_RELAY_ADDRESS" \
       -e "SERVER_RATE_MIBPS=$SERVER_RATE_MIBPS" -e "SERVER_RATE_KIBPS=$SERVER_RATE_KIBPS" \
       -e "SERVER_APP_PORT=$app_port" \
       --mount "type=bind,src=$REMOTE_DIR/containers/fknat,dst=/opt/fknat,readonly" \
@@ -781,7 +1137,7 @@ start_remote_servers() {
       "$BASE_IMAGE" bash /opt/server-entrypoint.sh >/dev/null
   done
 
-  for index in $(seq 1 5); do
+  for index in $(seq 1 "$SERVER_COUNT"); do
     name=server-$(printf '%02d' "$index")
     container=$CONTAINER_PREFIX-$name
     ready=0
@@ -803,8 +1159,13 @@ start_remote_servers() {
 
 start_servers() {
   phase local-servers
-  if [[ $CONTAINER_PLACEMENT == relay-hosts ]]; then
+  if [[ $SERVER_CONTAINER_PLACEMENT == remote ]]; then
     start_remote_servers
+    if [[ $CLIENT_CONTAINER_PLACEMENT == local ]]; then
+      docker network create --subnet "$DOCKER_SUBNET" "$NETWORK_NAME" >/dev/null 2>&1 || {
+        docker network inspect "$NETWORK_NAME" >/dev/null
+      }
+    fi
     return
   fi
   docker network create --subnet "$DOCKER_SUBNET" "$NETWORK_NAME" >/dev/null
@@ -819,7 +1180,7 @@ start_servers() {
   fi
   printf 'server\tnode_id\tcontainer\n' > "$RESULTS_ROOT/server-nodes.tsv"
   local index name container node_id
-  for index in $(seq 1 5); do
+  for index in $(seq 1 "$SERVER_COUNT"); do
     name=server-$(printf '%02d' "$index")
     container=$CONTAINER_PREFIX-$name
     mkdir -p "$RESULTS_ROOT/$name"
@@ -835,7 +1196,7 @@ start_servers() {
       "$BASE_IMAGE" bash /opt/server-entrypoint.sh >/dev/null
   done
 
-  for index in $(seq 1 5); do
+  for index in $(seq 1 "$SERVER_COUNT"); do
     name=server-$(printf '%02d' "$index")
     container=$CONTAINER_PREFIX-$name
     ready=0
@@ -856,7 +1217,7 @@ start_servers() {
 
 start_clients_and_preflight() {
   phase client-preflight
-  if [[ $CONTAINER_PLACEMENT == relay-hosts ]]; then
+  if [[ $CLIENT_CONTAINER_PLACEMENT == remote ]]; then
     start_remote_clients_and_preflight
     return
   fi
@@ -864,7 +1225,7 @@ start_clients_and_preflight() {
   for index in $(seq 1 10); do
     name=client-$(printf '%02d' "$index")
     container=$CONTAINER_PREFIX-$name
-    server_number=$(( (index + 1) / 2 ))
+    server_number=$(( (index - 1) % SERVER_COUNT + 1 ))
     server_name=server-$(printf '%02d' "$server_number")
     server_id=$(awk -F '\t' -v target="$server_name" '$1 == target {print $2}' "$RESULTS_ROOT/server-nodes.tsv")
     [[ $server_id =~ ^[0-9a-f]{64}$ ]] || return 1
@@ -875,6 +1236,7 @@ start_clients_and_preflight() {
       -e "PREFLIGHT_SIZE_MIB=$PREFLIGHT_SIZE_MIB" \
       -e "PREFLIGHT_MAX_TIME_SECONDS=$PREFLIGHT_MAX_TIME_SECONDS" \
       -e "FILE_MAX_TIME_SECONDS=$FILE_MAX_TIME_SECONDS" \
+      -e "CLIENT_FILE_CONCURRENCY=$CLIENT_FILE_CONCURRENCY" \
       --mount "type=bind,src=$ROOT_DIR/bin/fknat,dst=/opt/fknat,readonly" \
       --mount "type=bind,src=$SCRIPT_DIR/client-entrypoint.sh,dst=/opt/client-entrypoint.sh,readonly" \
       --mount "type=bind,src=$SCRIPT_DIR/client-worker.sh,dst=/opt/client-worker.sh,readonly" \
@@ -906,7 +1268,7 @@ start_remote_clients_and_preflight() {
   for index in $(seq 1 10); do
     name=client-$(printf '%02d' "$index")
     container=$CONTAINER_PREFIX-$name
-    server_number=$(( (index + 1) / 2 ))
+    server_number=$(( (index - 1) % SERVER_COUNT + 1 ))
     server_name=server-$(printf '%02d' "$server_number")
     server_id=$(awk -F '\t' -v target="$server_name" '$1 == target {print $2}' "$RESULTS_ROOT/server-nodes.tsv")
     [[ $server_id =~ ^[0-9a-f]{64}$ ]] || return 1
@@ -919,6 +1281,7 @@ start_remote_clients_and_preflight() {
       -e "PREFLIGHT_SIZE_MIB=$PREFLIGHT_SIZE_MIB" \
       -e "PREFLIGHT_MAX_TIME_SECONDS=$PREFLIGHT_MAX_TIME_SECONDS" \
       -e "FILE_MAX_TIME_SECONDS=$FILE_MAX_TIME_SECONDS" \
+      -e "CLIENT_FILE_CONCURRENCY=$CLIENT_FILE_CONCURRENCY" \
       --mount "type=bind,src=$REMOTE_DIR/containers/fknat,dst=/opt/fknat,readonly" \
       --mount "type=bind,src=$REMOTE_DIR/containers/client-entrypoint.sh,dst=/opt/client-entrypoint.sh,readonly" \
       --mount "type=bind,src=$REMOTE_DIR/containers/client-worker.sh,dst=/opt/client-worker.sh,readonly" \
@@ -954,7 +1317,7 @@ run_workload() {
   local workload_start deadline all_done index name container state exit_code workload_status
   workload_start=$(date +%s)
   metadata workload_start_epoch "$workload_start"
-  if [[ $CONTAINER_PLACEMENT == relay-hosts ]]; then
+  if [[ $CLIENT_CONTAINER_PLACEMENT == remote ]]; then
     ssh193 "touch '$REMOTE_DIR/control/start'"
   else
     touch "$RESULTS_ROOT/control/start"
@@ -964,14 +1327,20 @@ run_workload() {
   outage_pid=$!
   printf '%s\n' "$outage_pid" > "$RESULTS_ROOT/control/outage.pid"
   RESULTS_ROOT=$RESULTS_ROOT RUN_LABEL=$RUN_LABEL REMOTE_DIR=$REMOTE_DIR \
-    UNIT_INDEX=$UNIT_INDEX UNIT_RELAY_SERVER=$UNIT_RELAY_SERVER UNIT_RELAY_TUNNEL=$UNIT_RELAY_TUNNEL \
+    UNIT_INDEX=$UNIT_INDEX UNIT_RELAY_CLIENT=$UNIT_RELAY_CLIENT UNIT_RELAY_SERVER=$UNIT_RELAY_SERVER \
+    CLIENT_RELAY_SSH_TARGET=$CLIENT_RELAY_SSH_TARGET CLIENT_RELAY_SSH_PORT=$CLIENT_RELAY_SSH_PORT \
+    SERVER_RELAY_SSH_TARGET=$SERVER_RELAY_SSH_TARGET SERVER_RELAY_SSH_PORT=$SERVER_RELAY_SSH_PORT \
+    UNIT_RELAY_TUNNEL=$UNIT_RELAY_TUNNEL \
     UNIT_LOCAL_TUNNEL=$UNIT_LOCAL_TUNNEL \
     RELAY_TCP_PATH=$RELAY_TCP_PATH \
     CONTAINER_PLACEMENT=$CONTAINER_PLACEMENT REMOTE_DOCKER_HOST=$REMOTE_DOCKER_HOST \
     CA_PUBLIC_URL=$CA_PUBLIC_URL CA_LOCAL_URL=$CA_LOCAL_URL bash "$SCRIPT_DIR/monitor.sh" &
   monitor_pid=$!
   printf '%s\n' "$monitor_pid" > "$RESULTS_ROOT/control/monitor.pid"
-  RESULTS_ROOT=$RESULTS_ROOT UNIT_INDEX=$UNIT_INDEX UNIT_RELAY_SERVER=$UNIT_RELAY_SERVER \
+  RESULTS_ROOT=$RESULTS_ROOT UNIT_INDEX=$UNIT_INDEX UNIT_RELAY_CLIENT=$UNIT_RELAY_CLIENT \
+    CLIENT_RELAY_SSH_TARGET=$CLIENT_RELAY_SSH_TARGET CLIENT_RELAY_SSH_PORT=$CLIENT_RELAY_SSH_PORT \
+    UNIT_RELAY_SERVER=$UNIT_RELAY_SERVER \
+    SERVER_RELAY_SSH_TARGET=$SERVER_RELAY_SSH_TARGET SERVER_RELAY_SSH_PORT=$SERVER_RELAY_SSH_PORT \
     bash "$SCRIPT_DIR/relay-resource-monitor.sh" &
   relay_resource_pid=$!
   printf '%s\n' "$relay_resource_pid" > "$RESULTS_ROOT/control/relay-resource-monitor.pid"
@@ -983,7 +1352,7 @@ run_workload() {
     for index in $(seq 1 10); do
       name=client-$(printf '%02d' "$index")
       container=$CONTAINER_PREFIX-$name
-      if [[ $CONTAINER_PLACEMENT == relay-hosts ]]; then
+      if [[ $CLIENT_CONTAINER_PLACEMENT == remote ]]; then
         state=$(docker193 inspect --format '{{.State.Status}}' "$container" 2>/dev/null || printf missing)
       else
         state=$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null || printf missing)
@@ -1000,7 +1369,7 @@ run_workload() {
     completed=$(find "$RESULTS_ROOT" -mindepth 2 -maxdepth 2 -name complete -type f | wc -l)
     total_mib=$(awk -F= '$1 == "successful_mib" {sum += $2} END {print sum + 0}' "$RESULTS_ROOT"/client-*/progress.env 2>/dev/null || true)
     total_mib=${total_mib:-0}
-    log "workload progress completed_clients=$completed successful_mib=$total_mib/51200"
+    log "workload progress completed_clients=$completed successful_mib=$total_mib/$TOTAL_MIB"
     sleep 30
   done
 
@@ -1009,7 +1378,7 @@ run_workload() {
   for index in $(seq 1 10); do
     name=client-$(printf '%02d' "$index")
     container=$CONTAINER_PREFIX-$name
-    if [[ $CONTAINER_PLACEMENT == relay-hosts ]]; then
+    if [[ $CLIENT_CONTAINER_PLACEMENT == remote ]]; then
       exit_code=$(docker193 inspect --format '{{.State.ExitCode}}' "$container" 2>/dev/null || printf 255)
     else
       exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container" 2>/dev/null || printf 255)
@@ -1020,7 +1389,7 @@ run_workload() {
   metadata workload_finished_epoch "$(date +%s)"
   metadata workload_exit_code "$workload_status"
   touch "$RESULTS_ROOT/control/workload.done"
-  if [[ $CONTAINER_PLACEMENT == relay-hosts ]]; then
+  if [[ $CLIENT_CONTAINER_PLACEMENT == remote ]]; then
     ssh193 "touch '$REMOTE_DIR/control/workload.done'" || true
   fi
   [[ -n $outage_pid ]] && wait "$outage_pid" || true
@@ -1036,8 +1405,8 @@ drain_queues() {
   phase billing-drain
   docker start "$CA_CONTAINER" >/dev/null 2>&1 || true
   wait_http "$CA_PUBLIC_URL" 120 || true
-  printf 'epoch\telapsed_seconds\trelay_client_index_depth\trelay_server_depth\ttotal_depth\n' > "$RESULTS_ROOT/queue-drain.tsv"
-  local started index_json server_json index_depth server_depth total elapsed
+  printf 'epoch\telapsed_seconds\trelay_client_index_depth\trelay_client_depth\trelay_server_depth\ttotal_depth\n' > "$RESULTS_ROOT/queue-drain.tsv"
+  local started index_json client_json server_json index_depth client_depth server_depth total elapsed
   started=$(date +%s)
   while :; do
     if index_json=$(ssh193 "'$REMOTE_DIR/billingqueue-inspect' -path '$REMOTE_DIR/relay-client-index.waitsubmit'" 2>/dev/null); then
@@ -1045,18 +1414,23 @@ drain_queues() {
     else
       index_depth=-1
     fi
-    if server_json=$(ssh198 "'$REMOTE_DIR/billingqueue-inspect' -path '$REMOTE_DIR/relay-server.waitsubmit'" 2>/dev/null); then
+    if client_json=$(ssh160 "'$REMOTE_DIR/billingqueue-inspect' -path '$REMOTE_DIR/relay-client.waitsubmit'" 2>/dev/null); then
+      client_depth=$(printf '%s' "$client_json" | json_number depth -1)
+    else
+      client_depth=-1
+    fi
+    if server_json=$(ssh_server_relay "'$REMOTE_DIR/billingqueue-inspect' -path '$REMOTE_DIR/relay-server.waitsubmit'" 2>/dev/null); then
       server_depth=$(printf '%s' "$server_json" | json_number depth -1)
     else
       server_depth=-1
     fi
-    if [[ $index_depth =~ ^[0-9]+$ && $server_depth =~ ^[0-9]+$ ]]; then
-      total=$((index_depth + server_depth))
+    if [[ $index_depth =~ ^[0-9]+$ && $client_depth =~ ^[0-9]+$ && $server_depth =~ ^[0-9]+$ ]]; then
+      total=$((index_depth + client_depth + server_depth))
     else
       total=-1
     fi
     elapsed=$(( $(date +%s) - started ))
-    printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$elapsed" "$index_depth" "$server_depth" "$total" >> "$RESULTS_ROOT/queue-drain.tsv"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$elapsed" "$index_depth" "$client_depth" "$server_depth" "$total" >> "$RESULTS_ROOT/queue-drain.tsv"
     ((total == 0)) && break
     ((elapsed >= 600)) && break
     sleep 10
@@ -1073,6 +1447,7 @@ generate_report() {
 
 main() {
   : > "$RESULTS_ROOT/metadata.env"
+  start_monitor_dashboard
   metadata run_id "$RUN_ID"
   metadata created_epoch "$(date +%s)"
   metadata ca_public_url "$CA_PUBLIC_URL"
@@ -1081,29 +1456,39 @@ main() {
   metadata local_tunnel_address "$LOCAL_TUNNEL_ADDRESS"
   metadata remote_tunnel_address "$REMOTE_TUNNEL_ADDRESS"
   metadata client_relay_address "$CLIENT_RELAY_ADDRESS"
+  metadata client_relay_ssh_target "$CLIENT_RELAY_SSH_TARGET:$CLIENT_RELAY_SSH_PORT"
+  metadata server_relay_ssh_target "$SERVER_RELAY_SSH_TARGET:$SERVER_RELAY_SSH_PORT"
+  metadata server_container_ssh_target "$SERVER_CONTAINER_SSH_TARGET:$SERVER_CONTAINER_SSH_PORT"
   metadata docker_subnet "$DOCKER_SUBNET"
   metadata relay_tcp_path "$RELAY_TCP_PATH"
   metadata container_placement "$CONTAINER_PLACEMENT"
+  metadata client_container_placement "$CLIENT_CONTAINER_PLACEMENT"
+  metadata server_container_placement "$SERVER_CONTAINER_PLACEMENT"
   if [[ $RELAY_TCP_PATH == direct ]]; then
     metadata protocol_split "direct-tcp-udp"
   else
     metadata protocol_split "udp-direct-tcp-reverse-ssh"
   fi
-  metadata total_bytes "$((50 * 1024 * 1024 * 1024))"
+  metadata total_gib "$TOTAL_GIB"
+  metadata total_mib "$TOTAL_MIB"
+  metadata per_client_mib "$PER_CLIENT_MIB"
+  metadata total_bytes "$((TOTAL_GIB * 1024 * 1024 * 1024))"
   metadata client_count 10
-  metadata server_count 5
+  metadata server_count "$SERVER_COUNT"
   metadata server_rate_mibps "$SERVER_RATE_MIBPS"
   metadata server_rate_kibps "$SERVER_RATE_KIBPS"
   metadata preflight_size_mib "$PREFLIGHT_SIZE_MIB"
   metadata preflight_max_time_seconds "$PREFLIGHT_MAX_TIME_SECONDS"
   metadata client_ready_timeout_seconds "$CLIENT_READY_TIMEOUT_SECONDS"
   metadata file_max_time_seconds "$FILE_MAX_TIME_SECONDS"
+  metadata client_file_concurrency "$CLIENT_FILE_CONCURRENCY"
   metadata tunnel_pump_buffer "$TUNNEL_PUMP_BUF"
   metadata tunnel_coalesce_ms "$TUNNEL_COALESCE_MS"
   metadata tunnel_max_chunk "$TUNNEL_MAX_CHUNK"
   metadata tunnel_stream_send_window "$TUNNEL_STREAM_SEND_WINDOW"
   metadata tunnel_send_window "$TUNNEL_SEND_WINDOW"
   metadata max_pending_billing_data_sends "$BNFS_MAX_PENDING_BILLING_DATA_SENDS"
+  metadata compression_disabled "$FKNAT_DISABLE_COMPRESSION"
   metadata endpoint_transport "$ENDPOINT_TRANSPORT"
   metadata endpoint_single_tcp "$ENDPOINT_SINGLE_TCP"
   metadata endpoint_runtime_tcp_width "$ENDPOINT_RUNTIME_TCP_WIDTH"

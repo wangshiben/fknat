@@ -4,7 +4,9 @@
 
 - Client 在本机监听随机或固定 TCP 端口，把该端口接受的连接通过 natP2p 网络转发到指定 NatServer NodeID。
 - Server 注册自己的稳定 NodeID，接收 NatClient 隧道，并把每条逻辑流转发到本机端口或指定的 `IP/域名:端口`。
-- natP2pSDK 负责 CA 准入、Relay 注册、节点握手、计费以及 KCP/TCP 底层路径；fknat 只处理应用侧 TCP 代理。
+- natP2pSDK 负责 CA 准入、Relay 注册、节点握手、计费以及 KCP/TCP 底层路径；fknat 处理应用侧 TCP 代理，并在业务流进入隧道前按方向使用 Zstd 帧压缩。
+
+面向部署人员的 NAT Client/NAT Server 独立说明见 [NAT_USAGE.md](NAT_USAGE.md)。
 
 ## 安全说明
 
@@ -13,7 +15,8 @@
 - 节点身份默认自动生成到用户配置目录中的 `fknat/client.identity` 或 `fknat/server.identity`，用于保持 NodeID 稳定。
 - `--billing-key` 必须指向 CA Web 导出的扣费私钥 JSON 文件。文件权限必须为 `0600` 或更严格。
 - fknat 不会复制、打印或写入扣费私钥内容。不要把扣费私钥粘贴到 `--identity`，也不建议把密钥内容直接放在命令行参数中。
-- production 安全档必须同时配置 CA URL 和扣费私钥。
+- CA Web 地址由发布二进制固定为 `https://ca.fknat.top`，不接受命令行参数或环境变量覆盖。
+- production 安全档必须配置扣费私钥。
 
 ```bash
 chmod 600 /secure/path/billing-key.json
@@ -41,7 +44,7 @@ SDK 发布为可获取的 Go 模块版本后，可以移除 `replace` 并更新�
 向导会依次询问：
 
 1. Client 或 Server 角色；
-2. Index 地址、CA Web API URL、扣费密钥文件和节点身份文件；
+2. Index 地址、扣费密钥文件和节点身份文件；
 3. Client 的目标 Server NodeID 与本地监听端口，或 Server 的实际应用地址。
 
 Client 输入监听端口 `0` 或 `127.0.0.1:0` 时，系统会随机选择空闲端口，并在启动后打印实际地址。只输入 `8080` 等数字时默认监听 `127.0.0.1:8080`；如需局域网访问，可显式填写 `0.0.0.0:8080`。
@@ -57,7 +60,6 @@ Server 的实际应用地址可以只写本地端口，例如 `8080`，等价于
   --non-interactive \
   --mode server \
   --index index.example.com:9000 \
-  --ca https://ca.example.com \
   --billing-key /secure/server-billing-key.json \
   --target 127.0.0.1:8080
 ```
@@ -69,7 +71,6 @@ Server 启动后会打印 64 位 NodeID。然后启动 Client，随机监听一�
   --non-interactive \
   --mode client \
   --index index.example.com:9000 \
-  --ca https://ca.example.com \
   --billing-key /secure/client-billing-key.json \
   --server-id '<Server 打印的 64 位 NodeID>' \
   --listen 127.0.0.1:0
@@ -85,17 +86,31 @@ Server 启动后会打印 64 位 NodeID。然后启动 Client，随机监听一�
 
 ## 本地开发模式
 
-没有正式 CA 和扣费密钥时，只能显式使用 SDK 的开发安全档：
+没有独立扣费密钥时，可以显式使用 SDK 的开发安全档：
 
 ```bash
 ./bin/fknat --security-profile development
 ```
 
-开发档仅用于受控测试，不能替代 production 准入和计费。
+开发档仍连接二进制内置的 `https://ca.fknat.top`，只用于受控测试，不能替代 production 准入和计费。需要自建 CA 的隔离测试应直接使用 SDK/框架测试入口；发布版 fknat 不提供 CA 重定向能力。
 
 ## 当前协议范围
 
-fknat 暴露的是 TCP 监听端口和 TCP 后端。KCP 是 natP2p 网络中的底层传输路径，不表示本地端口是 UDP。UDP 应用代理需要 SDK 额外提供数据报会话语义后再实现。
+fknat 暴露的是 TCP 监听端口和 TCP 后端。KCP 是 natP2p 网络中的底层传输路径，不表示本地端口是 UDP。应用 TCP 流在 Client→Server 和 Server→Client 两个方向分别封装为带方向标记的 Zstd 帧；不可压缩数据自动使用原文帧。UDP 应用代理仍需要 SDK 额外提供数据报会话语义后再实现，当前不会压缩 SDK 的 KCP/控制面数据包。
+
+## 当前公网拓扑
+
+部署参数按以下角色配置，CA Web 统一通过固定域名访问：
+
+```text
+NatClient (193) -> Client Relay (160) -> Server Relay (198) -> NatServer (192)
+                                      \
+                                       CA Web (https://ca.fknat.top)
+```
+
+Client 使用 `--relay <160-relay-address>`，Server 保持使用 `--relay <198-relay-address>`。Zstd 只位于 fknat 的业务 TCP 转发边界，不改变上述 Relay、KCP/UDP 或 CA 控制面的协议地址。
+
+`scripts/real-50g/run.sh` 会启动只读监控页面，默认监听 `0.0.0.0:18090`；内网访问本机对应地址的 `/`，例如 `http://192.168.1.12:18090/`。页面提供运行选择、Client 进度、160/198 Relay 队列与服务状态、CA 健康和 Relay 资源采样，不展示凭据或原始日志。可用 `MONITOR_PORT` 修改端口。
 
 ## 累计计费凭证
 
@@ -122,6 +137,7 @@ Relay 不会逐包访问 CA Web。它先验证并累计端到端计费 Record，
 | `BNFS_KCP_SEND_WINDOW` | 256 | KCP 发送窗口，范围 32..65535 |
 | `BNFS_KCP_RECEIVE_WINDOW` | 1024 | KCP 接收窗口，范围 32..65535 |
 | `BNFS_KCP_SESSION_BUFFER_BYTES` | 4194304 | KCP socket 缓冲，范围 1..256 MiB |
+| `BNFS_MAX_PENDING_BILLING_DATA_SENDS` | 16 | 单条 NAT 连接的计费数据发送槽，范围 1..4096；高 RTT/高带宽链路可按压测逐步提高 |
 
 本次公网受控验证使用了 `TUNNEL_MAX_CHUNK=262144`、流窗口 32、carrier 窗口 128、KCP 发送/接收窗口 1536/6144 和 16 MiB socket 缓冲。放大窗口会增加每个活动会话的内存上限，应结合实际 RTT、丢包和并发数逐步调整。
 

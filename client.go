@@ -41,7 +41,7 @@ func runClient(ctx context.Context, config appConfig, output io.Writer, logger *
 		IndexAddress: config.IndexAddress,
 		RelayAddress: config.RelayAddress,
 		Identity:     config.IdentityFile,
-		CAURL:        config.CAURL,
+		CAURL:        caURLForConfig(config),
 		DialAttempts: config.DialAttempts,
 		RetryDelay:   config.RetryDelay,
 	})
@@ -112,12 +112,12 @@ func runClient(ctx context.Context, config appConfig, output io.Writer, logger *
 			stream, streamErr := manager.OpenStream(runContext)
 			if streamErr != nil {
 				if runContext.Err() == nil {
-					logger.Printf("为本地连接 %s 打开隧道失败: %v", local.RemoteAddr(), streamErr)
+					logger.Printf("event=tunnel_error stage=open_stream remote=%s target=%s err=%v", local.RemoteAddr(), target, streamErr)
 				}
 				return
 			}
-			if bridgeErr := tunnel.Bridge(stream, local, tunnel.DefaultCopyOptions()); bridgeErr != nil && runContext.Err() == nil {
-				logger.Printf("本地连接 %s 转发结束: %v", local.RemoteAddr(), bridgeErr)
+			if bridgeErr := compressedBridge(local, stream, compressionClientMode, tunnel.DefaultCopyOptions()); bridgeErr != nil && runContext.Err() == nil {
+				logger.Printf("event=tunnel_error stage=bridge remote=%s target=%s err=%v", local.RemoteAddr(), target, bridgeErr)
 			}
 		}(localConnection)
 	}

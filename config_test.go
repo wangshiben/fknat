@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,18 +76,33 @@ func TestNormalizeForwardTarget(t *testing.T) {
 	}
 }
 
-func TestProductionConfigRequiresCAAndBillingKey(t *testing.T) {
+func TestProductionConfigRequiresBillingKey(t *testing.T) {
 	config := appConfig{
 		Role: roleClient, IndexAddress: "index.example:9000",
 		SecurityProfile: "production", ServerNodeID: strings.Repeat("a", 64),
 		RelayCount: 1, DialAttempts: 1, RetryDelay: 1, ReconnectDelay: 1,
 	}
-	if err := config.normalizeAndValidate(); err == nil || !strings.Contains(err.Error(), "CA Web") {
-		t.Fatalf("normalizeAndValidate() error = %v, want missing CA error", err)
-	}
-	config.CAURL = "https://ca.example"
 	if err := config.normalizeAndValidate(); err == nil || !strings.Contains(err.Error(), "扣费") {
 		t.Fatalf("normalizeAndValidate() error = %v, want missing billing key error", err)
+	}
+}
+
+func TestProductionCAURLCannotBeOverridden(t *testing.T) {
+	t.Setenv("FKNAT_CA_URL", "https://attacker.invalid")
+	if productionCAURL != "https://ca.fknat.top" {
+		t.Fatalf("productionCAURL = %q", productionCAURL)
+	}
+	if _, _, err := parseFlags([]string{"--ca", "https://attacker.invalid"}, io.Discard); err == nil {
+		t.Fatal("removed --ca flag unexpectedly accepted")
+	}
+}
+
+func TestDevelopmentProfileDisablesExternalCA(t *testing.T) {
+	if got := caURLForConfig(appConfig{SecurityProfile: "development"}); got != "" {
+		t.Fatalf("development CA URL = %q, want empty", got)
+	}
+	if got := caURLForConfig(appConfig{SecurityProfile: "production"}); got != productionCAURL {
+		t.Fatalf("production CA URL = %q, want %q", got, productionCAURL)
 	}
 }
 
@@ -109,7 +125,7 @@ func TestValidateSecretFilePermissions(t *testing.T) {
 
 func TestCompleteInteractiveClient(t *testing.T) {
 	config := appConfig{IndexAddress: "index.example:9000", SecurityProfile: "development"}
-	input := strings.NewReader("1\n\n\n\n\n\n" + strings.Repeat("a", 64) + "\n0\n")
+	input := strings.NewReader("1\n\n\n\n\n" + strings.Repeat("a", 64) + "\n0\n")
 	var output strings.Builder
 	if err := completeInteractive(input, &output, &config); err != nil {
 		t.Fatalf("completeInteractive: %v", err)

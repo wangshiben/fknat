@@ -22,7 +22,7 @@ func runServer(ctx context.Context, config appConfig, output io.Writer, logger *
 		RelayAddresses: config.RelayAddresses,
 		RelayCount:     config.RelayCount,
 		Identity:       config.IdentityFile,
-		CAURL:          config.CAURL,
+		CAURL:          caURLForConfig(config),
 		MaxSessions:    config.MaxSessions,
 		AcceptQueue:    config.AcceptQueue,
 	})
@@ -35,6 +35,7 @@ func runServer(ctx context.Context, config appConfig, output io.Writer, logger *
 		return fmt.Errorf("启动 NatServer: %w", err)
 	}
 	var sessions sync.WaitGroup
+	streamSlots := make(chan struct{}, config.MaxStreams)
 	defer func() {
 		_ = listener.Close()
 		_ = server.Close()
@@ -53,6 +54,7 @@ func runServer(ctx context.Context, config appConfig, output io.Writer, logger *
 		fmt.Fprintf(output, "服务 Relay: %s\n", snapshot.RelayAddress)
 	}
 	fmt.Fprintf(output, "最大 NatClient 会话: %d\n", snapshot.MaxSessions)
+	fmt.Fprintf(output, "最大并发逻辑流: %d（每会话 %d）\n", config.MaxStreams, config.MaxStreamsPerSession)
 	fmt.Fprintln(output, "把上面的节点 ID 提供给 Client。按 Ctrl+C 退出。")
 
 	for {
@@ -68,20 +70,25 @@ func runServer(ctx context.Context, config appConfig, output io.Writer, logger *
 		sessions.Add(1)
 		go func(clientConnection sdk.Connection) {
 			defer sessions.Done()
-			serveClientConnection(ctx, clientConnection, config.ForwardTarget, logger)
+			serveClientConnectionWithLimits(ctx, clientConnection, config.ForwardTarget, config.MaxStreamsPerSession, streamSlots, logger)
 		}(connection)
 	}
 }
 
 func serveClientConnection(ctx context.Context, connection sdk.Connection, target string, logger *log.Logger) {
+	serveClientConnectionWithLimits(ctx, connection, target, 128, make(chan struct{}, 1024), logger)
+}
+
+func serveClientConnectionWithLimits(ctx context.Context, connection sdk.Connection, target string, maxStreamsPerSession int, globalSlots chan struct{}, logger *log.Logger) {
 	peer := connection.Peer()
-	session, err := tunnel.NewServerSession(ctx, connection)
+	session, err := tunnel.NewServerSessionWithOptions(ctx, connection, tunnel.SessionOptions{AcceptQueue: maxStreamsPerSession})
 	if err != nil {
 		_ = connection.Close()
-		logger.Printf("为 NatClient %s 创建隧道会话失败: %v", peer.ID, err)
+		logger.Printf("event=tunnel_error stage=session_create peer=%s err=%v", peer.ID, err)
 		return
 	}
 	var streams sync.WaitGroup
+	perSessionSlots := make(chan struct{}, maxStreamsPerSession)
 	defer func() {
 		_ = session.Close()
 		streams.Wait()
@@ -90,21 +97,38 @@ func serveClientConnection(ctx context.Context, connection sdk.Connection, targe
 		stream, acceptErr := session.Accept()
 		if acceptErr != nil {
 			if ctx.Err() == nil && !errors.Is(acceptErr, tunnel.ErrSessionClosed) {
-				logger.Printf("NatClient %s 隧道会话结束: %v", peer.ID, acceptErr)
+				logger.Printf("event=tunnel_error stage=stream_accept peer=%s err=%v", peer.ID, acceptErr)
 			}
 			return
+		}
+		select {
+		case globalSlots <- struct{}{}:
+		default:
+			logger.Printf("event=tunnel_reject stage=global_stream_limit peer=%s limit=%d", peer.ID, cap(globalSlots))
+			_ = stream.Close()
+			continue
+		}
+		select {
+		case perSessionSlots <- struct{}{}:
+		default:
+			<-globalSlots
+			logger.Printf("event=tunnel_reject stage=session_stream_limit peer=%s limit=%d", peer.ID, cap(perSessionSlots))
+			_ = stream.Close()
+			continue
 		}
 		streams.Add(1)
 		go func(remoteStream *tunnel.Stream) {
 			defer streams.Done()
+			defer func() { <-perSessionSlots }()
+			defer func() { <-globalSlots }()
 			defer remoteStream.Close()
 			backend, dialErr := (&net.Dialer{}).DialContext(ctx, "tcp", target)
 			if dialErr != nil {
-				logger.Printf("连接实际应用 %s 失败: %v", target, dialErr)
+				logger.Printf("event=tunnel_error stage=backend_dial peer=%s target=%s err=%v", peer.ID, target, dialErr)
 				return
 			}
-			if bridgeErr := tunnel.Bridge(remoteStream, backend, tunnel.DefaultCopyOptions()); bridgeErr != nil && ctx.Err() == nil {
-				logger.Printf("NatClient %s 到 %s 的流转发结束: %v", peer.ID, target, bridgeErr)
+			if bridgeErr := compressedBridge(remoteStream, backend, compressionServerMode, tunnel.DefaultCopyOptions()); bridgeErr != nil && ctx.Err() == nil {
+				logger.Printf("event=tunnel_error stage=bridge peer=%s target=%s err=%v", peer.ID, target, bridgeErr)
 			}
 		}(stream)
 	}

@@ -5,7 +5,6 @@ umask 077
 
 : "${FKNAT_INDEX:?}"
 : "${FKNAT_RELAY:?}"
-: "${FKNAT_CA_URL:?}"
 : "${SERVER_NAME:?}"
 SERVER_APP_PORT=${SERVER_APP_PORT:-5173}
 SERVER_RATE_MIBPS=${SERVER_RATE_MIBPS:-4}
@@ -51,7 +50,6 @@ curl -fsS --max-time 2 "http://127.0.0.1:${SERVER_APP_PORT}/health" >/dev/null
   --mode server \
   --index "$FKNAT_INDEX" \
   --relay "$FKNAT_RELAY" \
-  --ca "$FKNAT_CA_URL" \
   --billing-key /state/billing-key.json \
   --identity /state/identity.key \
   --target "127.0.0.1:${SERVER_APP_PORT}" \
