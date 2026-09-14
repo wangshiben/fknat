@@ -287,7 +287,7 @@ func validateSecretFile(value string) (string, error) {
 	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 64<<10 {
 		return "", errors.New("必须是 1..65536 字节的普通文件")
 	}
-	if info.Mode().Perm()&0o077 != 0 {
+	if !secretFileModeIsSecure(info.Mode()) {
 		return "", fmt.Errorf("权限必须为 0600 或更严格，当前为 %04o；请先执行 chmod 600", info.Mode().Perm())
 	}
 	return absolute, nil
