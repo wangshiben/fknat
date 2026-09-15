@@ -65,7 +65,7 @@ func parseFlags(args []string, output io.Writer) (appConfig, cliOptions, error) 
 	flags := flag.NewFlagSet("fknat", flag.ContinueOnError)
 	flags.SetOutput(output)
 	flags.StringVar(&roleValue, "mode", envOrDefault("FKNAT_MODE", ""), "运行角色: client 或 server")
-	flags.StringVar(&config.IndexAddress, "index", envOrDefault("FKNAT_INDEX_ADDRESS", "p2p.example.com:9000"), "Index 地址 host:port")
+	flags.StringVar(&config.IndexAddress, "index", envOrDefault("FKNAT_INDEX_ADDRESS", ""), "Index 地址 host:port；留空时从 CA Web 自动发现")
 	flags.StringVar(&config.RelayAddress, "relay", envOrDefault("FKNAT_RELAY_ADDRESS", ""), "固定使用一个 Relay；为空则通过 Index 发现")
 	flags.StringVar(&relaysValue, "relays", envOrDefault("FKNAT_RELAY_ADDRESSES", ""), "Server 使用的多个 Relay，逗号分隔，最多三个")
 	flags.IntVar(&config.RelayCount, "relay-count", 1, "Server 自动选择的 Relay 数量，1..3")
@@ -126,11 +126,12 @@ func (config *appConfig) normalizeAndValidate() error {
 	if config.SecurityProfile != "development" && config.SecurityProfile != "staging" && config.SecurityProfile != "production" {
 		return fmt.Errorf("不支持的安全档 %q", config.SecurityProfile)
 	}
-	if config.IndexAddress == "" {
-		return errors.New("Index 地址不能为空")
-	}
-	if err := validateHostPort(config.IndexAddress, false, false); err != nil {
-		return fmt.Errorf("Index 地址无效: %w", err)
+	if config.IndexAddress != "" {
+		if err := validateHostPort(config.IndexAddress, false, false); err != nil {
+			return fmt.Errorf("Index 地址无效: %w", err)
+		}
+	} else if config.RelayAddress == "" && len(config.RelayAddresses) == 0 && config.SecurityProfile == "development" {
+		return errors.New("开发安全档未配置 Index 或固定 Relay")
 	}
 	if config.RelayAddress != "" {
 		if err := validateHostPort(config.RelayAddress, false, false); err != nil {

@@ -32,7 +32,7 @@ func completeInteractive(input io.Reader, output io.Writer, config *appConfig) e
 		}
 	}
 	var err error
-	config.IndexAddress, err = ask(reader, output, "Index 地址", config.IndexAddress, true)
+	config.IndexAddress, err = ask(reader, output, "Index 地址（可留空，由 CA Web 自动选择）", config.IndexAddress, false)
 	if err != nil {
 		return err
 	}
