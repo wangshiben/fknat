@@ -1,12 +1,18 @@
 # fknat
 
-`fknat` 是基于 [`natP2pSDK`](../natP2pSDK) 的双角色 TCP 端口转发工具。一个二进制既可以作为 NatClient，也可以作为 NatServer：
+`fknat` 是基于 [`natP2pSDK`](https://github.com/wangshiben/natP2pSDK) 的双角色 TCP 端口转发工具。一个二进制既可以作为 NatClient，也可以作为 NatServer：
 
 - Client 在本机监听随机或固定 TCP 端口，把该端口接受的连接通过 natP2p 网络转发到指定 NatServer NodeID。
 - Server 注册自己的稳定 NodeID，接收 NatClient 隧道，并把每条逻辑流转发到本机端口或指定的 `IP/域名:端口`。
 - natP2pSDK 负责 CA 准入、Relay 注册、节点握手、计费以及 KCP/TCP 底层路径；fknat 处理应用侧 TCP 代理，并在业务流进入隧道前按方向使用 Zstd 帧压缩。
 
 面向部署人员的 NAT Client/NAT Server 独立说明见 [NAT_USAGE.md](NAT_USAGE.md)。
+
+
+## 使用说明
+
+参考[使用说明](Usage.md)，发布包在release中
+
 
 ## 安全说明
 
@@ -15,7 +21,6 @@
 - 节点身份默认自动生成到用户配置目录中的 `fknat/client.identity` 或 `fknat/server.identity`，用于保持 NodeID 稳定。
 - `--billing-key` 必须指向 CA Web 导出的扣费私钥 JSON 文件。文件权限必须为 `0600` 或更严格。
 - fknat 不会复制、打印或写入扣费私钥内容。不要把扣费私钥粘贴到 `--identity`，也不建议把密钥内容直接放在命令行参数中。
-- CA Web 地址由发布二进制固定为 `https://ca.fknat.top`，不接受命令行参数或环境变量覆盖。
 - production 安全档必须配置扣费私钥。
 
 ```bash
