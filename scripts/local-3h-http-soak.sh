@@ -68,7 +68,10 @@ fi
 [[ $HTTP_BASE_PORT =~ ^[0-9]+$ && $CLIENT_BASE_PORT =~ ^[0-9]+$ ]] || die "ports must be numeric"
 [[ -x $FKNAT_BIN ]] || die "FKNAT_BIN is not executable: $FKNAT_BIN"
 [[ -x $HTTP_BIN ]] || die "HTTP_BIN is not executable: $HTTP_BIN"
-[[ -n $INDEX_ADDRESS && -n $CLIENT_RELAY_ADDRESS && -n $SERVER_RELAY_ADDRESS ]] || die "INDEX_ADDRESS and relay addresses are required"
+[[ -n $CLIENT_RELAY_ADDRESS && -n $SERVER_RELAY_ADDRESS ]] || die "client and server relay addresses are required"
+if [[ -z $INDEX_ADDRESS && $SECURITY_PROFILE != production ]]; then
+  die "automatic Index discovery requires the production security profile"
+fi
 if [[ $SECURITY_PROFILE == production ]]; then
   [[ -f $BILLING_KEY_FILE ]] || die "BILLING_KEY_FILE is required in production"
 elif [[ $SECURITY_PROFILE != development && $SECURITY_PROFILE != staging ]]; then
@@ -86,12 +89,19 @@ fi
 
 billing_args=()
 [[ -n $BILLING_KEY_FILE ]] && billing_args=(--billing-key "$BILLING_KEY_FILE")
+index_args=()
+[[ -n $INDEX_ADDRESS ]] && index_args=(--index "$INDEX_ADDRESS")
 
 mkdir -p "$RUN_DIR"/{logs,state,requests,failures}
 chmod 700 "$RUN_DIR" "$RUN_DIR"/{logs,state,requests,failures}
 printf 'run_id=%s\nstarted_epoch=%s\nduration_seconds=%s\nrequest_interval_seconds=%s\nrequest_concurrency=%s\nmax_pending_billing_data_sends=%s\nfile_size_mb=%s\nindex_address=%s\nrelay_address=%s\nclient_relay_address=%s\nserver_relay_address=%s\n' \
   "$RUN_ID" "$(date +%s)" "$DURATION_SECONDS" "$REQUEST_INTERVAL_SECONDS" "$REQUEST_CONCURRENCY" "$BNFS_MAX_PENDING_BILLING_DATA_SENDS" "$FILE_SIZE_MB" "$INDEX_ADDRESS" "${RELAY_ADDRESS:-split}" "$CLIENT_RELAY_ADDRESS" "$SERVER_RELAY_ADDRESS" > "$RUN_DIR/metadata.env"
 printf 'security_profile=%s\n' "$SECURITY_PROFILE" >> "$RUN_DIR/metadata.env"
+if [[ -n $INDEX_ADDRESS ]]; then
+  printf 'index_discovery=explicit\n' >> "$RUN_DIR/metadata.env"
+else
+  printf 'index_discovery=ca-web\n' >> "$RUN_DIR/metadata.env"
+fi
 printf 'fknat_legacy_flags=%s\n' "$FKNAT_LEGACY_FLAGS" >> "$RUN_DIR/metadata.env"
 printf 'minimum_aggregate_bytes_per_second=%s\nminimum_client_bytes_per_second=%s\n' \
   "$MIN_AGGREGATE_BYTES_PER_SECOND" "$MIN_CLIENT_BYTES_PER_SECOND" >> "$RUN_DIR/metadata.env"
@@ -177,7 +187,7 @@ start_natserver() {
   BNFS_SECURITY_PROFILE="$SECURITY_PROFILE" BNFS_MAX_PENDING_BILLING_DATA_SENDS="$BNFS_MAX_PENDING_BILLING_DATA_SENDS" BNFS_DISABLE_KCP="$BNFS_DISABLE_KCP" \
   TUNNEL_MAX_CHUNK="$TUNNEL_MAX_CHUNK" TUNNEL_STREAM_SEND_WINDOW="$TUNNEL_STREAM_SEND_WINDOW" TUNNEL_SEND_WINDOW="$TUNNEL_SEND_WINDOW" \
   BNFS_KCP_SEND_WINDOW="$BNFS_KCP_SEND_WINDOW" BNFS_KCP_RECEIVE_WINDOW="$BNFS_KCP_RECEIVE_WINDOW" \
-  BNFS_KCP_SESSION_BUFFER_BYTES="$BNFS_KCP_SESSION_BUFFER_BYTES" "$FKNAT_BIN" --non-interactive --mode server --index "$INDEX_ADDRESS" --relay "$SERVER_RELAY_ADDRESS" \
+  BNFS_KCP_SESSION_BUFFER_BYTES="$BNFS_KCP_SESSION_BUFFER_BYTES" "$FKNAT_BIN" --non-interactive --mode server "${index_args[@]}" --relay "$SERVER_RELAY_ADDRESS" \
     "${billing_args[@]}" --identity "$RUN_DIR/state/server-$index.identity" \
     --target "127.0.0.1:$target_port" --max-sessions 32 --accept-queue 64 \
     "${stream_limit_args[@]}" \
@@ -190,7 +200,7 @@ start_natclient() {
   BNFS_SECURITY_PROFILE="$SECURITY_PROFILE" BNFS_MAX_PENDING_BILLING_DATA_SENDS="$BNFS_MAX_PENDING_BILLING_DATA_SENDS" BNFS_DISABLE_KCP="$BNFS_DISABLE_KCP" \
   TUNNEL_MAX_CHUNK="$TUNNEL_MAX_CHUNK" TUNNEL_STREAM_SEND_WINDOW="$TUNNEL_STREAM_SEND_WINDOW" TUNNEL_SEND_WINDOW="$TUNNEL_SEND_WINDOW" \
   BNFS_KCP_SEND_WINDOW="$BNFS_KCP_SEND_WINDOW" BNFS_KCP_RECEIVE_WINDOW="$BNFS_KCP_RECEIVE_WINDOW" \
-  BNFS_KCP_SESSION_BUFFER_BYTES="$BNFS_KCP_SESSION_BUFFER_BYTES" "$FKNAT_BIN" --non-interactive --mode client --index "$INDEX_ADDRESS" --relay "$CLIENT_RELAY_ADDRESS" \
+  BNFS_KCP_SESSION_BUFFER_BYTES="$BNFS_KCP_SESSION_BUFFER_BYTES" "$FKNAT_BIN" --non-interactive --mode client "${index_args[@]}" --relay "$CLIENT_RELAY_ADDRESS" \
     "${billing_args[@]}" --identity "$RUN_DIR/state/client-$index.identity" \
     --server-id "$target_id" --listen "127.0.0.1:$listen_port" \
     --dial-attempts 30 --retry-delay 2s --reconnect-delay 2s \
