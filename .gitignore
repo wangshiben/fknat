@@ -1,5 +1,7 @@
 /bin/
 /dist/
+/web/node_modules/
+/web/.vite/
 /test-results/
 *.log
 coverage.out
