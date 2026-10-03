@@ -68,6 +68,7 @@ sudo /opt/fknat/control.sh edit-config
 
 在现有 config/app.env 中至少确认以下值：
 
+```env
 CONFIGURED=1
 BNFS_SECURITY_PROFILE=production
 BNFS_BILLING_KEY_FILE=config/billing-key.json
@@ -78,6 +79,7 @@ FKNAT_RELAY_ADDRESS=
 FKNAT_RELAY_ADDRESSES=
 FKNAT_RELAY_COUNT=1
 FKNAT_FORWARD_TARGET=127.0.0.1:8080
+```
 
 FKNAT_FORWARD_TARGET 是被代理的真实 HTTP/TCP 服务。Index 和 Relay 均留空时走
 CA Web 自动发现；需要固定拓扑时才填写 host:port。保存后重启并查看日志：
@@ -93,6 +95,7 @@ sudo /opt/fknat/control.sh logs
 
 Client 建议安装在另一台机器，并使用另一份扣费密钥。在 config/app.env 中至少确认：
 
+```env
 CONFIGURED=1
 BNFS_SECURITY_PROFILE=production
 BNFS_BILLING_KEY_FILE=config/billing-key.json
@@ -102,6 +105,9 @@ FKNAT_INDEX_ADDRESS=
 FKNAT_RELAY_ADDRESS=
 FKNAT_LISTEN_ADDRESS=127.0.0.1:18081
 FKNAT_SERVER_NODE_ID=<NAT Server 输出的 64 位 NodeID>
+```
+
+
 
 重启服务后，本地应用访问 127.0.0.1:18081，连接会经 Relay 转发到 Server 的
 FKNAT_FORWARD_TARGET。只有确实需要局域网其他机器访问时，才把监听地址改成
