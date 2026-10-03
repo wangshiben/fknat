@@ -40,10 +40,16 @@ SDK 发布为可获取的 Go 模块版本后，可以移除 `replace` 并更新�
 
 ## 交互式使用
 
-直接运行即可进入向导：
+直接运行会启动 Web 管理页（默认 `http://0.0.0.0:8088/`）：
 
 ```bash
 ./bin/fknat
+```
+
+需要终端配置向导时显式使用 `--interactive`：
+
+```bash
+./bin/fknat --interactive
 ```
 
 向导会依次询问：
@@ -99,9 +105,25 @@ Server 启动后会打印 64 位 NodeID。然后启动 Client，随机监听一�
 
 开发档仍连接二进制内置的 `https://ca.fknat.top`，只用于受控测试，不能替代 production 准入和计费。需要自建 CA 的隔离测试应直接使用 SDK/框架测试入口；发布版 fknat 不提供 CA 重定向能力。
 
+## Web 管理和多端口转发
+
+fknat 启动后默认监听 `0.0.0.0:8088`，打开根路径即可使用 React 管理界面。React 运行时随二进制内置，不依赖公网 CDN。可用 `--web-listen` 或 `FKNAT_WEB_LISTEN` 修改地址，配置会原子写入 `~/.config/fknat/config.json`（也可用 `--config` 指定）。即使 NodeID、端口或扣费密钥路径还没有填写，Web 页面仍会启动并显示等待配置状态；保存后会自动重启对应的 Client/Server 运行时，连接失败时可点击“重试连接”。页面采用与 CA Web 一致的浅色绿色控制台风格，并在手机屏幕上自动切换为顶部导航布局。
+
+Web 管理界面默认启用登录保护。首次启动且没有现成认证配置时，程序会创建用户名 `admin`，随机生成一条初始密码，并将 bcrypt 哈希保存到配置文件；初始密码只在启动日志中显示一次。需要自定义账号时，在启动参数中同时设置 `--web-user` 和 `--web-password`（密码至少 8 个字符）：
+
+```bash
+./fknat --web-user admin --web-password 'change-this-password' --web-listen 0.0.0.0:28090
+```
+
+也可以使用 `FKNAT_WEB_USER` 与 `FKNAT_WEB_PASSWORD` 环境变量。启动时密码会通过 bcrypt 保存为 `web_password_hash`，配置文件不会保存明文密码；登录后端通过 QuicFrameWork 的 `RouteDisPatch.Request.GetSession()` 建立会话并由框架自动下发 `quickSession` Cookie，前端不会手动写入认证 Cookie。未登录访问运行和配置 API 会返回 HTTP 401。建议始终配合 HTTPS 反向代理或只监听受信任的管理网卡。
+
+Client 页面支持添加、编辑和删除多个 TCP/UDP 映射，例如 `127.0.0.1:18080` → Server 的本机目标。Server 页面支持动态维护 TCP/UDP 转发端口，每条规则直接填写本机 `host:port` 目标；单个目标无需指定路由键，多个目标时按目标端口分流。每个隧道流在业务数据前带有版本化路由头（连接 ID、传输类型、可选路由键），Server 收到后直接连接本机目标并返回明确的接受或拒绝响应。UDP 使用一条隧道流承载一个请求/响应数据报，适用于 DNS 和常见请求响应型 UDP 服务。
+
+Web 中的 `waiting_for_configuration` 表示 Web 控制台已启动，但节点运行条件还没有满足；选择角色、填写必要字段和映射后点击“保存并启动”即可触发运行。production 安全档还需要 CA Web 导出的扣费密钥路径。Server 收到远端流后会直接按协议连接本机转发端口，不会额外监听或请求一个 Server 端口。单个目标由默认路由直接连接；多个目标时 Client 映射携带目标端口进行分流，例如目标 `127.0.0.1:8080`。
+
 ## 当前协议范围
 
-fknat 暴露的是 TCP 监听端口和 TCP 后端。KCP 是 natP2p 网络中的底层传输路径，不表示本地端口是 UDP。应用 TCP 流在 Client→Server 和 Server→Client 两个方向分别封装为带方向标记的 Zstd 帧；不可压缩数据自动使用原文帧。UDP 应用代理仍需要 SDK 额外提供数据报会话语义后再实现，当前不会压缩 SDK 的 KCP/控制面数据包。
+fknat 支持本地 TCP/UDP 监听和 Server 端 TCP/UDP 后端。KCP 是 natP2p 网络中的底层传输路径，不表示本地端口是 UDP。应用 TCP 流在 Client→Server 和 Server→Client 两个方向分别封装为带方向标记的 Zstd 帧；不可压缩数据自动使用原文帧。UDP 映射采用一条隧道流承载一个请求/响应数据报；路由头和 SDK 控制面不会经过业务压缩。
 
 ## 当前公网拓扑
 

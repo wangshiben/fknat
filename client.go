@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	sdk "github.com/wangshiben/natP2pSDK"
@@ -30,7 +32,7 @@ type clientSessionManager struct {
 	closed  bool
 }
 
-func runClient(ctx context.Context, config appConfig, output io.Writer, logger *log.Logger) error {
+func runClient(ctx context.Context, config appConfig, output io.Writer, logger *log.Logger, reportRouteError ...func(error)) error {
 	target, err := parseServerNodeID(config.ServerNodeID)
 	if err != nil {
 		return err
@@ -55,20 +57,12 @@ func runClient(ctx context.Context, config appConfig, output io.Writer, logger *
 		return fmt.Errorf("启动 NatClient: %w", err)
 	}
 
-	listener, err := net.Listen("tcp", config.ListenAddress)
-	if err != nil {
-		cancel()
-		_ = client.Close()
-		return fmt.Errorf("监听 %s: %w", config.ListenAddress, err)
-	}
-
 	manager := &clientSessionManager{
 		dialer: client, target: target, reconnectDelay: config.ReconnectDelay, logger: logger,
 	}
 	var connections sync.WaitGroup
 	defer func() {
 		cancel()
-		_ = listener.Close()
 		_ = manager.Close()
 		connections.Wait()
 		_ = client.Close()
@@ -80,12 +74,10 @@ func runClient(ctx context.Context, config appConfig, output io.Writer, logger *
 	go func() {
 		select {
 		case <-runContext.Done():
-			_ = listener.Close()
 		case backgroundError, ok := <-client.Errors():
 			if ok && backgroundError != nil {
 				logger.Printf("NatClient 后台注册失效: %v", backgroundError)
 				cancel()
-				_ = listener.Close()
 			}
 		}
 	}()
@@ -94,32 +86,159 @@ func runClient(ctx context.Context, config appConfig, output io.Writer, logger *
 	fmt.Fprintf(output, "本节点 ID: %s\n", client.NodeID())
 	fmt.Fprintf(output, "目标 Server: %s\n", target)
 	fmt.Fprintf(output, "入口 Relay: %s\n", client.EntryRelay())
-	fmt.Fprintf(output, "本地 TCP 监听: %s\n", listener.Addr())
-	fmt.Fprintln(output, "该端口接受的所有 TCP 连接都会转发到目标 NatServer。按 Ctrl+C 退出。")
-
-	for {
-		localConnection, acceptErr := listener.Accept()
-		if acceptErr != nil {
-			if runContext.Err() != nil || errors.Is(acceptErr, net.ErrClosed) {
-				return nil
-			}
-			return fmt.Errorf("接受本地 TCP 连接: %w", acceptErr)
+	mappings := append([]PortMapping(nil), config.ClientMappings...)
+	if len(mappings) == 0 {
+		mappings = []PortMapping{{ID: "client-1", Protocol: "tcp", Listen: config.ListenAddress, RemotePort: config.RemotePort, Enabled: true}}
+	}
+	fmt.Fprintf(output, "客户端映射数量: %d\n", len(mappings))
+	fmt.Fprintln(output, "按 Ctrl+C 退出。")
+	var nextID atomic.Uint64
+	listeners := make([]io.Closer, 0, len(mappings))
+	defer func() {
+		for _, listener := range listeners {
+			_ = listener.Close()
 		}
+	}()
+	for _, mapping := range mappings {
+		if !mapping.Enabled {
+			continue
+		}
+		mapping.Protocol = normalizeProtocol(mapping.Protocol)
+		if mapping.Listen == "" {
+			return fmt.Errorf("Client 映射 %s 缺少本地监听地址", mapping.ID)
+		}
+		if mapping.Protocol == "udp" {
+			address, listenErr := net.ResolveUDPAddr("udp", mapping.Listen)
+			if listenErr != nil {
+				return listenErr
+			}
+			udpListener, listenErr := net.ListenUDP("udp", address)
+			if listenErr != nil {
+				return fmt.Errorf("监听 UDP %s: %w", mapping.Listen, listenErr)
+			}
+			listeners = append(listeners, udpListener)
+			fmt.Fprintf(output, "本地 UDP 监听: %s -> Server UDP %d\n", udpListener.LocalAddr(), mapping.RemotePort)
+			connections.Add(1)
+			go func(listener *net.UDPConn, mapping PortMapping) {
+				defer connections.Done()
+				serveClientUDP(runContext, listener, manager, mapping, &nextID, logger, reportRouteError...)
+			}(udpListener, mapping)
+			continue
+		}
+		tcpListener, listenErr := net.Listen("tcp", mapping.Listen)
+		if listenErr != nil {
+			return fmt.Errorf("监听 TCP %s: %w", mapping.Listen, listenErr)
+		}
+		listeners = append(listeners, tcpListener)
+		fmt.Fprintf(output, "本地 TCP 监听: %s -> Server TCP %d\n", tcpListener.Addr(), mapping.RemotePort)
 		connections.Add(1)
-		go func(local net.Conn) {
+		go func(listener net.Listener, mapping PortMapping) {
 			defer connections.Done()
-			defer local.Close()
-			stream, streamErr := manager.OpenStream(runContext)
-			if streamErr != nil {
-				if runContext.Err() == nil {
-					logger.Printf("event=tunnel_error stage=open_stream remote=%s target=%s err=%v", local.RemoteAddr(), target, streamErr)
+			for {
+				localConnection, acceptErr := listener.Accept()
+				if acceptErr != nil {
+					if runContext.Err() != nil || errors.Is(acceptErr, net.ErrClosed) {
+						return
+					}
+					logger.Printf("event=local_accept_error mapping=%s err=%v", mapping.ID, acceptErr)
+					return
+				}
+				connections.Add(1)
+				go func(local net.Conn) {
+					defer connections.Done()
+					defer local.Close()
+					stream, streamErr := openRoutedStream(runContext, manager, &nextID, mapping, logger)
+					if streamErr != nil {
+						if len(reportRouteError) > 0 && reportRouteError[0] != nil {
+							reportRouteError[0](fmt.Errorf("映射 %s 连接被 Server 拒绝: %w", mapping.ID, streamErr))
+						}
+						if runContext.Err() == nil {
+							logger.Printf("event=route_rejected mapping=%s err=%v", mapping.ID, streamErr)
+						}
+						return
+					}
+					if bridgeErr := compressedBridge(local, stream, compressionClientMode, tunnel.DefaultCopyOptions()); bridgeErr != nil && runContext.Err() == nil {
+						logger.Printf("event=tunnel_error stage=bridge mapping=%s err=%v", mapping.ID, bridgeErr)
+					}
+				}(localConnection)
+			}
+		}(tcpListener, mapping)
+	}
+	<-runContext.Done()
+	return nil
+}
+
+func openRoutedStream(ctx context.Context, manager *clientSessionManager, nextID *atomic.Uint64, mapping PortMapping, logger *log.Logger) (*tunnel.Stream, error) {
+	stream, err := manager.OpenStream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	transport := transportTCP
+	if normalizeProtocol(mapping.Protocol) == "udp" {
+		transport = transportUDP
+	}
+	if err := writeRouteHeader(stream, routeHeader{ConnectionID: nextID.Add(1), Transport: transport, RemotePort: mapping.RemotePort}); err != nil {
+		_ = stream.Close()
+		return nil, err
+	}
+	ack, err := readRouteAck(stream)
+	if err != nil {
+		_ = stream.Close()
+		return nil, err
+	}
+	if !ack.Accepted {
+		_ = stream.Close()
+		return nil, fmt.Errorf("server rejected route code=%d: %s", ack.Code, ack.Message)
+	}
+	return stream, nil
+}
+
+func serveClientUDP(ctx context.Context, listener *net.UDPConn, manager *clientSessionManager, mapping PortMapping, nextID *atomic.Uint64, logger *log.Logger, reportRouteError ...func(error)) {
+	buffer := make([]byte, 64*1024)
+	for {
+		_ = listener.SetReadDeadline(time.Now().Add(time.Second))
+		read, source, err := listener.ReadFromUDP(buffer)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			logger.Printf("event=udp_read_error mapping=%s err=%v", mapping.ID, err)
+			return
+		}
+		payload := append([]byte(nil), buffer[:read]...)
+		go func(source *net.UDPAddr, payload []byte) {
+			stream, err := openRoutedStream(ctx, manager, nextID, mapping, logger)
+			if err != nil {
+				if ctx.Err() == nil {
+					if len(reportRouteError) > 0 && reportRouteError[0] != nil {
+						reportRouteError[0](fmt.Errorf("UDP 映射 %s 连接被 Server 拒绝: %w", mapping.ID, err))
+					}
+					logger.Printf("event=udp_route_rejected mapping=%s err=%v", mapping.ID, err)
 				}
 				return
 			}
-			if bridgeErr := compressedBridge(local, stream, compressionClientMode, tunnel.DefaultCopyOptions()); bridgeErr != nil && runContext.Err() == nil {
-				logger.Printf("event=tunnel_error stage=bridge remote=%s target=%s err=%v", local.RemoteAddr(), target, bridgeErr)
+			defer stream.Close()
+			var length [4]byte
+			binary.BigEndian.PutUint32(length[:], uint32(len(payload)))
+			if err := writeAll(stream, length[:]); err != nil || writeAll(stream, payload) != nil {
+				return
 			}
-		}(localConnection)
+			if _, err := io.ReadFull(stream, length[:]); err != nil {
+				return
+			}
+			responseLength := binary.BigEndian.Uint32(length[:])
+			if responseLength > 64*1024 {
+				return
+			}
+			response := make([]byte, responseLength)
+			if _, err := io.ReadFull(stream, response); err != nil {
+				return
+			}
+			_, _ = listener.WriteToUDP(response, source)
+		}(source, payload)
 	}
 }
 

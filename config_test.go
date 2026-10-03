@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 func TestParseRole(t *testing.T) {
@@ -87,6 +89,21 @@ func TestProductionConfigRequiresBillingKey(t *testing.T) {
 	}
 }
 
+func TestServerDefaultDispatchTargetMayOmitLogicalPort(t *testing.T) {
+	config := appConfig{
+		Role: roleServer, SecurityProfile: "development", IndexAddress: "index.example:9000", RelayCount: 1,
+		ServerPorts: []AllowedPort{{ID: "default", Protocol: "tcp", Target: "127.0.0.1:8080", Enabled: true}},
+		MaxSessions: 1, AcceptQueue: 1, MaxStreams: 1, MaxStreamsPerSession: 1,
+	}
+	if err := config.normalizeAndValidate(); err != nil {
+		t.Fatalf("default dispatch target rejected: %v", err)
+	}
+	config.ServerPorts = append(config.ServerPorts, AllowedPort{ID: "second-default", Protocol: "tcp", Target: "127.0.0.1:8081", Enabled: true})
+	if err := config.normalizeAndValidate(); err == nil || !strings.Contains(err.Error(), "逻辑路由端口") {
+		t.Fatalf("multiple default targets error = %v", err)
+	}
+}
+
 func TestProductionCAURLCannotBeOverridden(t *testing.T) {
 	t.Setenv("FKNAT_CA_URL", "https://attacker.invalid")
 	if productionCAURL != "https://ca.fknat.top" {
@@ -135,5 +152,62 @@ func TestCompleteInteractiveClient(t *testing.T) {
 	}
 	if config.ListenAddress != "0" {
 		t.Fatalf("ListenAddress = %q, want 0", config.ListenAddress)
+	}
+}
+
+func TestConfigFileRoundTripAtomic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	original := appConfig{Role: roleClient, IndexAddress: "index.example:9000", ServerNodeID: strings.Repeat("a", 64), SecurityProfile: "development", ConfigFile: path, WebListenAddress: "0.0.0.0:8088", ClientMappings: []PortMapping{{ID: "web", Protocol: "tcp", Listen: "127.0.0.1:18080", RemotePort: 8080, Enabled: true}}}
+	if err := saveConfigFile(path, original); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadConfigFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Role != roleClient || loaded.ClientMappings[0].RemotePort != 8080 || loaded.WebListenAddress != "0.0.0.0:8088" {
+		t.Fatalf("loaded config = %+v", loaded)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("config mode = %04o, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestPrepareWebConfigDefaultsToPublicListenerAndAuthentication(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	config := appConfig{ConfigFile: path, SecurityProfile: "development"}
+	password, err := prepareWebConfig(&config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.WebListenAddress != "0.0.0.0:8088" {
+		t.Fatalf("WebListenAddress = %q, want 0.0.0.0:8088", config.WebListenAddress)
+	}
+	if config.WebUser != "admin" || password == "" || config.WebPasswordHash == "" {
+		t.Fatalf("default Web auth = user %q, password length %d, hash present %t", config.WebUser, len(password), config.WebPasswordHash != "")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(config.WebPasswordHash), []byte(password)); err != nil {
+		t.Fatalf("generated password does not match bcrypt hash: %v", err)
+	}
+	if err := saveConfigFile(path, config); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), password) {
+		t.Fatal("generated Web password was persisted in plaintext")
+	}
+	loaded, err := loadConfigFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.WebUser != "admin" || loaded.WebPasswordHash == "" {
+		t.Fatalf("persisted Web auth = user %q, hash present %t", loaded.WebUser, loaded.WebPasswordHash != "")
 	}
 }
