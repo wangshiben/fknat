@@ -6,12 +6,12 @@
 - Server 注册自己的稳定 NodeID，接收 NatClient 隧道，并把每条逻辑流转发到本机端口或指定的 `IP/域名:端口`。
 - natP2pSDK 负责 CA 准入、Relay 注册、节点握手、计费以及 KCP/TCP 底层路径；fknat 处理应用侧 TCP 代理，并在业务流进入隧道前按方向使用 Zstd 帧压缩。
 
-面向部署人员的 NAT Client/NAT Server 独立说明见 [NAT_USAGE.md](NAT_USAGE.md)。
+面向部署人员的 NAT Client/NAT Server 独立说明见 [USAGE.md](USAGE.md)。
 
 
 ## 使用说明
 
-参考[使用说明](Usage.md)，发布包在release中
+参考[使用说明](USAGE.md)，发布包在 release 中。
 
 
 ## 安全说明
