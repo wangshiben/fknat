@@ -146,33 +146,6 @@ Web 中的 `waiting_for_configuration` 表示 Web 控制台已启动，但节点
 
 fknat 支持本地 TCP/UDP 监听和 Server 端 TCP/UDP 后端。KCP 是 natP2p 网络中的底层传输路径，不表示本地端口是 UDP。应用 TCP 流在 Client→Server 和 Server→Client 两个方向分别封装为带方向标记的 Zstd 帧；不可压缩数据自动使用原文帧。UDP 映射采用一条隧道流承载一个请求/响应数据报；路由头和 SDK 控制面不会经过业务压缩。
 
-## 当前公网拓扑
-
-部署参数按以下角色配置，CA Web 统一通过固定域名访问：
-
-```text
-NatClient (193) -> Client Relay (160) -> Server Relay (198) -> NatServer (192)
-                                      \
-                                       CA Web (https://ca.fknat.top)
-```
-
-Client 使用 `--relay <160-relay-address>`，Server 保持使用 `--relay <198-relay-address>`。Zstd 只位于 fknat 的业务 TCP 转发边界，不改变上述 Relay、KCP/UDP 或 CA 控制面的协议地址。
-
-`scripts/real-50g/run.sh` 会启动只读监控页面，默认监听 `0.0.0.0:18090`；内网访问本机对应地址的 `/`，例如 `http://192.168.1.12:18090/`。页面提供运行选择、Client 进度、160/198 Relay 队列与服务状态、CA 健康和 Relay 资源采样，不展示凭据或原始日志。可用 `MONITOR_PORT` 修改端口。
-
-## 累计计费凭证
-
-Relay 不会逐包访问 CA Web。它先验证并累计端到端计费 Record，再在下列任一条件先满足时要求付款方双签一张累计凭证：
-
-- 自上一张凭证后的认证 E2E Record 累计接近 50 MiB（52,428,800 bytes）；
-- 首个尚未双签的 Record 已等待 1 分钟。
-
-正常关闭时还会强制冲刷不足 50 MiB、也未满 1 分钟的尾单。双签凭证先进入 Relay 的持久 `waitSubmit` 队列，再由后台提交 CA；CA 暂时不可达不会进入逐包转发热路径。
-
-单个原子 Record 仍最多为 1 MiB。若下一条 Record 会使累计值越过 50 MiB 上限，Relay 会在接收该 Record 前提交当前窗口，因此实测单张增量可能略低于 50 MiB。当前 SDK 还会把节点层 `[]byte` 放入 JSON 信封，JSON 的 base64 开销属于认证 E2E Record 字节，所以原始 TCP 文件大小与 CA 看到的累计字节不是严格 1:1。
-
-压缩凭证频率会扩大信用敞口：单付款方、单 Relay、单 Session 最多可先产生约一个窗口的未双签流量，余额不足可能在下一次 CA 结算时才触发 cutoff。
-
 ## 吞吐调优
 
 默认值偏向受控内存使用。高带宽时延积公网链路可以在 Client、Server 和 Relay 上一致设置以下环境变量：
@@ -210,8 +183,6 @@ bash scripts/transfer-soak.sh
 ```
 
 `DURATION_SECONDS` 是发起新传输的调度窗口，不是所有传输共享的强制结束时间。到达该时间后脚本不再启动新任务，但会继续等待已启动任务各自的 `TRANSFER_TIMEOUT_SECONDS`，因此脚本总耗时最多可能接近两者之和。成功传输会校验 SHA-256；单条下载超时记为 `TIMEOUT`，下载前的校验和请求失败记为 `CHECKSUM_FAILED`。
-
-2026-08-17 的旧策略 30 分钟过载测试和新 50 MiB/1 分钟策略受控验证见 [实测报告](REAL_TRANSFER_AND_BILLING_REPORT_2026-08-17.md)。
 
 ## License
 
