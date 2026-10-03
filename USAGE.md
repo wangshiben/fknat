@@ -1,7 +1,6 @@
 # fknat 使用说明
 
-本文档合并了原 `NAT_USAGE.md` 和 `Usage.md` 的内容，面向发布包安装、NAT
-Client/NAT Server 配置、Web 控制台操作和故障排查。
+本文档面向发布包安装、NAT Client/NAT Server 配置、Web 控制台操作和故障排查。
 
 fknat 是 NAT Client/NAT Server 共用的 TCP/UDP 转发程序：
 
@@ -135,8 +134,8 @@ Server 的作用是注册 NodeID，并把收到的逻辑流连接到本机后端
 ```env
 CONFIGURED=1
 BNFS_SECURITY_PROFILE=production
-BNFS_BILLING_KEY_FILE=config/billing-key.json
-FKNAT_IDENTITY_FILE=data/server.identity
+BNFS_BILLING_KEY_FILE=config/billing-key.json #此字段为扣费私钥文件，在ca web上登录自己的账号导出 
+FKNAT_IDENTITY_FILE= #第一次启动不用写此字段，此字段是NODE的身份标识文件，如果没写就默认生成
 FKNAT_MODE=server
 FKNAT_INDEX_ADDRESS=
 FKNAT_RELAY_ADDRESS=
@@ -352,17 +351,12 @@ curl -fsS https://ca.fknat.top/readyz
 5. 确认 NAT Server 的 `--target` 或转发端口可以从本机连接。
 6. 检查 Client/Server 日志中的注册、拨号、重连和后端连接错误。
 
-不要通过替换 CA 地址、删除身份文件或关闭生产准入来绕过问题。
+若均未解决，请查看位于下面路径的log反馈至issue或TG群组:
 
-在完整发布目录校验文件：
-
-```bash
-sha256sum -c SHA256SUMS
-sha256sum -c ARTIFACT_SHA256SUMS
+```pwd
+  • Linux：/opt/fknat/log/
+  • macOS：/usr/local/lib/fknat/log/
+  • Windows：%ProgramData%\FkNat\fknat\log\
 ```
 
-Windows 使用：
 
-```powershell
-Get-FileHash -Algorithm SHA256 <文件>
-```
