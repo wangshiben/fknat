@@ -5,6 +5,8 @@
 - `server`：注册 NAT Server NodeID，把隧道流量转发到本机业务服务。
 - `client`：在本机监听 TCP 端口，把连接转发到指定 NAT Server。
 
+启动后还会提供 Web 管理页（默认 `http://0.0.0.0:8088/`）。页面可以在没有预先填写 NodeID 或端口时完成配置；配置保存到 `~/.config/fknat/config.json`，保存后会自动重启对应运行角色。
+
 发布版内置 CA Web 地址：
 
 ```text
@@ -55,6 +57,8 @@ NAT Server 把收到的逻辑流转发给 `--target` 指定的本地业务服务
 [2001:db8::1]:443       指定 IPv6 服务
 ```
 
+Server 也可以在 Web 页面中添加多个转发端口。每条规则包含协议（TCP/UDP）和本机转发目标（`host:port`）；单个目标无需填写逻辑路由键，收到流后会直接连接该目标，不会在 Server 上额外监听请求端口。多个目标时由 Client 映射携带目标端口进行分流。未列入规则的请求会被拒绝，Client 页面会显示拒绝原因并可点击重试。
+
 ### 多 Relay Server
 
 同一 NAT Server 可注册到多个服务 Relay：
@@ -99,6 +103,8 @@ NAT Client 在本机监听一个 TCP 端口：
 
 Client 启动后会打印实际监听地址。访问该地址的 TCP 连接都会转发到目标 NAT Server 的 `--target`。
 
+需要多个映射或 UDP 时，推荐在 Web 页面添加映射。UDP 映射采用一个隧道流承载一个请求/响应数据报，适合 DNS 等请求响应型服务；TCP 和 UDP 请求都会携带连接 ID、协议类型和 Server 目标端口的路由头，由 Server 端允许列表校验后才拨号后端。
+
 ## 4. 连接与协议行为
 
 - 指定 `--relay`：固定从该 Relay 注册和拨号。
@@ -119,12 +125,18 @@ Client 启动后会打印实际监听地址。访问该地址的 TCP 连接都�
 | `--max-sessions` | 128 | Server 最大并发会话数 |
 | `--accept-queue` | 128 | Server 已认证会话等待队列 |
 | `--relay-count` | 1 | Server 自动选择的 Relay 数量，范围 1..3 |
+| `--web-listen` | `0.0.0.0:8088` | Web 管理地址；同机多个实例占用时会自动选择临时端口 |
+| `--web-user` | 首次启动为 `admin` | Web 管理用户名；可配合 `--web-password` 自定义 |
+| `--web-password` | 首次启动自动随机生成 | Web 管理密码，至少 8 个字符；仅保存 bcrypt 哈希，不写入明文 |
+| `--config` | 用户配置目录下 `fknat/config.json` | JSON 配置文件 |
 
-参数也可以通过当前程序支持的环境变量设置，例如 `FKNAT_INDEX_ADDRESS`、`FKNAT_RELAY_ADDRESS`、`FKNAT_IDENTITY_FILE`；环境变量只用于普通运行参数，不能修改 CA 地址。
+参数也可以通过当前程序支持的环境变量设置，例如 `FKNAT_INDEX_ADDRESS`、`FKNAT_RELAY_ADDRESS`、`FKNAT_IDENTITY_FILE`、`FKNAT_WEB_USER`、`FKNAT_WEB_PASSWORD`；环境变量只用于普通运行参数，不能修改 CA 地址。
+
+Web 根路径默认显示登录页。首次启动生成的初始密码只在启动日志中显示一次；登录、状态检查和退出登录均使用 QuicFrameWork Session，浏览器会自动保存后端下发的会话 Cookie。
 
 ## 6. 交互式和自动化启动
 
-直接运行 `./fkNat` 会进入交互向导。向导会询问角色、Index、扣费密钥、身份文件、Relay、NodeID 或后端地址；CA 地址只显示内置值，不再询问。
+直接运行 `./fknat` 会启动 Web 管理页。需要终端配置向导时使用 `./fknat --interactive`；向导会询问角色、Index、扣费密钥、身份文件、Relay、NodeID 或后端地址；CA 地址只显示内置值，不再询问。
 
 systemd、容器和自动化部署应使用 `--non-interactive`。缺少必填参数时程序会立即失败，不会等待输入。
 

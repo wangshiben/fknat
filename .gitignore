@@ -6,6 +6,7 @@ coverage.out
 .DS_Store
 /.private-*
 /.public-*
+/.local-web-*/
 /.stopped-*
 /releases/
 /current-public3h-*
