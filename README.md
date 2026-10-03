@@ -107,15 +107,36 @@ Server 启动后会打印 64 位 NodeID。然后启动 Client，随机监听一�
 
 ## Web 管理和多端口转发
 
-fknat 启动后默认监听 `0.0.0.0:8088`，打开根路径即可使用 React 管理界面。React 运行时随二进制内置，不依赖公网 CDN。可用 `--web-listen` 或 `FKNAT_WEB_LISTEN` 修改地址，配置会原子写入 `~/.config/fknat/config.json`（也可用 `--config` 指定）。即使 NodeID、端口或扣费密钥路径还没有填写，Web 页面仍会启动并显示等待配置状态；保存后会自动重启对应的 Client/Server 运行时，连接失败时可点击“重试连接”。页面采用与 CA Web 一致的浅色绿色控制台风格，并在手机屏幕上自动切换为顶部导航布局。
+fknat 启动后默认监听 `0.0.0.0:8088`，根路径会返回内置的 React 管理界面。React、React Router、CSS 和页面脚本全部编译进二进制，不依赖公网 CDN、Node.js 或额外的前端进程。可用 `--web-listen` 或 `FKNAT_WEB_LISTEN` 设置监听地址；Web 页面会显示这个地址，但不会允许在页面中修改，修改后需要重启进程。
 
-Web 管理界面默认启用登录保护。首次启动且没有现成认证配置时，程序会创建用户名 `admin`，随机生成一条初始密码，并将 bcrypt 哈希保存到配置文件；初始密码只在启动日志中显示一次。需要自定义账号时，在启动参数中同时设置 `--web-user` 和 `--web-password`（密码至少 8 个字符）：
+页面提供两个路由：`/overview` 运行概览和 `/config` 节点配置。即使 NodeID、端口或扣费密钥路径还没有填写，Web 服务仍会启动并显示 `waiting_for_configuration`。完成配置后点击“保存并启动”，程序会原子写入 `~/.config/fknat/config.json`（可用 `--config` 或 `FKNAT_CONFIG_FILE` 指定），并自动启动或重启对应的 Client/Server 运行时。运行状态每 3 秒刷新；连接异常时使用“重试连接”，错误会同时显示在页面和进程日志中。
+
+Web 管理界面默认启用登录保护。首次启动且没有现成认证配置时，程序会创建用户名 `admin`，随机生成一条初始密码，并将 bcrypt 哈希保存到配置文件；初始密码只在启动日志中显示一次。生产环境可以显式配置：
 
 ```bash
 ./fknat --web-user admin --web-password 'change-this-password' --web-listen 0.0.0.0:28090
 ```
 
-也可以使用 `FKNAT_WEB_USER` 与 `FKNAT_WEB_PASSWORD` 环境变量。启动时密码会通过 bcrypt 保存为 `web_password_hash`，配置文件不会保存明文密码；登录后端通过 QuicFrameWork 的 `RouteDisPatch.Request.GetSession()` 建立会话并由框架自动下发 `quickSession` Cookie，前端不会手动写入认证 Cookie。未登录访问运行和配置 API 会返回 HTTP 401。建议始终配合 HTTPS 反向代理或只监听受信任的管理网卡。
+安装包可以把相同字段写入 `config/app.env`：
+
+```text
+FKNAT_WEB_LISTEN=0.0.0.0:8088
+FKNAT_WEB_USER=admin
+FKNAT_WEB_PASSWORD=change-this-password
+```
+
+也可以使用 `FKNAT_WEB_USER` 与 `FKNAT_WEB_PASSWORD` 环境变量。密码会通过 bcrypt 保存为 `web_password_hash`，配置文件不会保存明文密码；登录后端通过 QuicFrameWork Session 建立会话并由框架自动下发 Cookie，前端不需要手动处理认证 Cookie。未登录访问运行和配置 API 会返回 HTTP 401。建议始终配合 HTTPS 反向代理或只监听受信任的管理网卡。
+
+### Web 页面配置流程
+
+在“节点配置”页面先选择运行模式，然后填写连接参数和业务规则：
+
+- **Client**：填写目标 Server NodeID，添加本地 TCP/UDP 监听地址，并可指定 Server 转发端口；点击“保存并启动”后，本地应用访问监听地址即可进入隧道。
+- **Server**：添加一个或多个真实后端 `host:port`，选择 TCP 或 UDP；收到远端流后 Server 直接连接这些后端，不会额外监听一个请求端口。
+- **Index/Relay**：留空时使用 CA Web 自动发现；需要固定拓扑时填写对应 `host:port`。
+- **扣费密钥路径**：只填写 CA Web 导出的 JSON 文件路径，Web API 不会上传或返回密钥内容。
+
+Client 映射和 Server 转发端口都可以在页面中添加、编辑和删除；Server 规则会在“运行概览”和“转发端口预览”中同步显示。`waiting_for_configuration` 只代表业务配置尚未完成，不代表 Web 服务故障。
 
 Client 页面支持添加、编辑和删除多个 TCP/UDP 映射，例如 `127.0.0.1:18080` → Server 的本机目标。Server 页面支持动态维护 TCP/UDP 转发端口，每条规则直接填写本机 `host:port` 目标；单个目标无需指定路由键，多个目标时按目标端口分流。每个隧道流在业务数据前带有版本化路由头（连接 ID、传输类型、可选路由键），Server 收到后直接连接本机目标并返回明确的接受或拒绝响应。UDP 使用一条隧道流承载一个请求/响应数据报，适用于 DNS 和常见请求响应型 UDP 服务。
 
