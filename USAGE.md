@@ -65,6 +65,20 @@ sudo ./install.sh
 Linux 默认安装到 `/opt/fknat`。安装后服务在 `CONFIGURED=0` 时只在后台等待
 配置，不会启动 NAT 业务进程。
 
+安装器还会把 `fknat` 注册为全局命令（通常位于 `/usr/local/bin/fknat`）。安装完成
+后无需进入安装目录即可查看帮助、编辑配置和管理后台服务：
+
+```bash
+fknat
+sudo fknat edit-config
+sudo fknat restart
+sudo fknat status
+sudo fknat logs
+```
+
+`fknat run ...` 可以调用同一份裸二进制在前台运行，`fknat --help` 会显示完整的
+二进制参数。卸载时，安装器只会删除自己创建的全局命令链接。
+
 ### macOS
 
 ```bash
@@ -74,6 +88,7 @@ sudo ./install.sh
 ```
 
 macOS 默认安装到 `/usr/local/lib/fknat`，通过 LaunchDaemon 在后台运行。
+macOS 安装器同样会创建 `/usr/local/bin/fknat` 全局命令。
 
 ### Windows
 
@@ -85,6 +100,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 ```
 
 Windows 默认安装到 `%ProgramData%\FkNat\fknat`，通过计划任务在后台运行。
+Windows 安装器会把 `fknat.cmd` 所在目录加入系统 PATH；重新打开终端后即可直接
+使用 `fknat` 命令。
 
 ## 4. 配置文件和 Web 控制台
 
