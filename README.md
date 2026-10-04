@@ -8,6 +8,8 @@
 
 面向部署人员的 NAT Client/NAT Server 独立说明见 [USAGE.md](USAGE.md)。
 
+如果您懒得看 一大串的部署说明，可以看这个[快速上手](UseDemo.md)
+
 
 ## 使用说明
 
