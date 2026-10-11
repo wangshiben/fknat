@@ -18,7 +18,7 @@ import (
 	"github.com/wangshiben/natP2pSDK/tunnel"
 )
 
-func runServer(ctx context.Context, config appConfig, output io.Writer, logger *log.Logger) error {
+func runServer(ctx context.Context, config appConfig, output io.Writer, logger *log.Logger, reportNodeID func(string)) error {
 	server, err := natserver.New(natserver.Config{
 		IndexAddress:           config.IndexAddress,
 		RelayAddress:           config.RelayAddress,
@@ -32,6 +32,9 @@ func runServer(ctx context.Context, config appConfig, output io.Writer, logger *
 	})
 	if err != nil {
 		return fmt.Errorf("创建 NatServer: %w", err)
+	}
+	if reportNodeID != nil {
+		reportNodeID(string(server.NodeID()))
 	}
 	listener, err := server.Listen(ctx)
 	if err != nil {

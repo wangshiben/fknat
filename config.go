@@ -248,11 +248,53 @@ func parseFlags(args []string, output io.Writer) (appConfig, cliOptions, error) 
 			return appConfig{}, cliOptions{}, err
 		}
 		config = mergeConfigDefaults(config, fileConfig)
-		// Explicit flags, including empty addresses and zero ports, override
-		// persisted configuration. The selected path must never be replaced by
-		// a config_file value read from an unrelated file.
+		// Environment values are only defaults. An explicit CLI flag is the
+		// highest-priority source and may override the persisted JSON value.
+		// The selected path must never be replaced by a config_file value read
+		// from an unrelated file.
 		flags.Visit(func(f *flag.Flag) {
 			switch f.Name {
+			case "mode":
+				parsedRole, parseErr := parseRole(roleValue)
+				if parseErr == nil {
+					config.Role = parsedRole
+				}
+			case "relays":
+				config.RelayAddresses = splitCSV(relaysValue)
+			case "relay-count":
+				config.RelayCount, _ = strconv.Atoi(f.Value.String())
+			case "billing-key":
+				config.BillingKeyFile = f.Value.String()
+			case "billing-snapshot":
+				config.BillingSnapshotFile = f.Value.String()
+			case "identity":
+				config.IdentityFile = f.Value.String()
+			case "listen":
+				config.ListenAddress = f.Value.String()
+			case "server-id":
+				config.ServerNodeID = f.Value.String()
+			case "target":
+				config.ForwardTarget = f.Value.String()
+			case "web-user":
+				config.WebUser = f.Value.String()
+			case "web-password":
+				config.WebPassword = f.Value.String()
+			case "max-sessions":
+				config.MaxSessions, _ = strconv.Atoi(f.Value.String())
+			case "accept-queue":
+				config.AcceptQueue, _ = strconv.Atoi(f.Value.String())
+			case "max-streams":
+				config.MaxStreams, _ = strconv.Atoi(f.Value.String())
+			case "max-streams-per-session":
+				config.MaxStreamsPerSession, _ = strconv.Atoi(f.Value.String())
+			case "dial-attempts":
+				config.DialAttempts, _ = strconv.Atoi(f.Value.String())
+			case "retry-delay":
+				config.RetryDelay, _ = time.ParseDuration(f.Value.String())
+			case "reconnect-delay":
+				config.ReconnectDelay, _ = time.ParseDuration(f.Value.String())
+			case "security-profile":
+				config.SecurityProfile = f.Value.String()
 			case "web-listen":
 				config.WebListenAddress = f.Value.String()
 			case "config":
@@ -276,79 +318,83 @@ func parseFlags(args []string, output io.Writer) (appConfig, cliOptions, error) 
 }
 
 func mergeConfigDefaults(current, file appConfig) appConfig {
-	if current.Role == "" {
+	if file.Role != "" {
 		current.Role = file.Role
 	}
-	if current.IndexAddress == "" {
+	if file.IndexAddress != "" {
 		current.IndexAddress = file.IndexAddress
 	}
-	if current.RelayAddress == "" {
+	if file.RelayAddress != "" {
 		current.RelayAddress = file.RelayAddress
 	}
-	if len(current.RelayAddresses) == 0 {
+	if len(file.RelayAddresses) != 0 {
 		current.RelayAddresses = file.RelayAddresses
 	}
-	if current.BillingKeyFile == "" {
+	if file.BillingKeyFile != "" {
 		current.BillingKeyFile = file.BillingKeyFile
 	}
-	if current.BillingSnapshotFile == "" {
+	if file.BillingSnapshotFile != "" {
 		current.BillingSnapshotFile = file.BillingSnapshotFile
 	}
-	if current.IdentityFile == "" {
+	if file.IdentityFile != "" {
 		current.IdentityFile = file.IdentityFile
 	}
-	if current.ListenAddress == "" {
+	if file.ListenAddress != "" {
 		current.ListenAddress = file.ListenAddress
 	}
-	if current.ServerNodeID == "" {
+	if file.ServerNodeID != "" {
 		current.ServerNodeID = file.ServerNodeID
 	}
-	if current.ForwardTarget == "" {
+	if file.ForwardTarget != "" {
 		current.ForwardTarget = file.ForwardTarget
 	}
-	if current.RemotePort == 0 {
+	if file.RemotePort != 0 {
 		current.RemotePort = file.RemotePort
 	}
-	if len(current.ClientMappings) == 0 {
+	if len(file.ClientMappings) != 0 {
 		current.ClientMappings = file.ClientMappings
 	}
-	if len(current.ServerPorts) == 0 {
+	if len(file.ServerPorts) != 0 {
 		current.ServerPorts = file.ServerPorts
 	}
-	if current.WebListenAddress == "" {
+	if file.WebListenAddress != "" {
 		current.WebListenAddress = file.WebListenAddress
 	}
-	if current.MaxSessions == 128 && file.MaxSessions != 0 {
+	if file.MaxSessions != 0 {
 		current.MaxSessions = file.MaxSessions
 	}
-	if current.AcceptQueue == 128 && file.AcceptQueue != 0 {
+	if file.AcceptQueue != 0 {
 		current.AcceptQueue = file.AcceptQueue
 	}
-	if current.MaxStreams == 1024 && file.MaxStreams != 0 {
+	if file.MaxStreams != 0 {
 		current.MaxStreams = file.MaxStreams
 	}
-	if current.MaxStreamsPerSession == 128 && file.MaxStreamsPerSession != 0 {
+	if file.MaxStreamsPerSession != 0 {
 		current.MaxStreamsPerSession = file.MaxStreamsPerSession
 	}
-	if current.DialAttempts == 12 && file.DialAttempts != 0 {
+	if file.DialAttempts != 0 {
 		current.DialAttempts = file.DialAttempts
 	}
-	if current.RetryDelay == 3*time.Second && file.RetryDelay != 0 {
+	if file.RetryDelay != 0 {
 		current.RetryDelay = file.RetryDelay
 	}
-	if current.ReconnectDelay == 3*time.Second && file.ReconnectDelay != 0 {
+	if file.ReconnectDelay != 0 {
 		current.ReconnectDelay = file.ReconnectDelay
 	}
-	if current.SecurityProfile == "production" && file.SecurityProfile != "" {
+	if file.SecurityProfile != "" {
 		current.SecurityProfile = file.SecurityProfile
 	}
-	if current.WebUser == "" {
+	if file.WebUser != "" {
 		current.WebUser = file.WebUser
 	}
-	if current.WebPasswordHash == "" {
+	if file.WebPasswordHash != "" {
+		// An environment password is only a bootstrap default. Once the
+		// persisted bcrypt hash exists, never re-hash that stale value on every
+		// restart. An explicit --web-password is applied after this merge.
+		current.WebPassword = ""
 		current.WebPasswordHash = file.WebPasswordHash
 	}
-	if current.RelayCount == 1 && file.RelayCount != 0 {
+	if file.RelayCount != 0 {
 		current.RelayCount = file.RelayCount
 	}
 	if current.ConfigFile == "" {
@@ -580,6 +626,11 @@ func configureSDKEnvironment(config appConfig) error {
 			return fmt.Errorf("设置 SDK 扣费密钥文件失败: %w", err)
 		}
 	}
+	if config.IdentityFile != "" {
+		if err := os.Setenv("BNFS_CA_CERT_CACHE_FILE", config.IdentityFile+".admission-cert.json"); err != nil {
+			return fmt.Errorf("设置 SDK 准入证书缓存文件失败: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -649,9 +700,6 @@ func validateSecretFile(value string) (string, error) {
 	}
 	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 64<<10 {
 		return "", errors.New("必须是 1..65536 字节的普通文件")
-	}
-	if !secretFileModeIsSecure(info.Mode()) {
-		return "", fmt.Errorf("权限必须为 0600 或更严格，当前为 %04o；请先执行 chmod 600", info.Mode().Perm())
 	}
 	return absolute, nil
 }

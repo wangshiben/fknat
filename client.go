@@ -33,6 +33,14 @@ type clientSessionManager struct {
 }
 
 func runClient(ctx context.Context, config appConfig, output io.Writer, logger *log.Logger, reportRouteError ...func(error)) error {
+	var report func(error)
+	if len(reportRouteError) > 0 {
+		report = reportRouteError[0]
+	}
+	return runClientWithNodeID(ctx, config, output, logger, report, nil)
+}
+
+func runClientWithNodeID(ctx context.Context, config appConfig, output io.Writer, logger *log.Logger, reportRouteError func(error), reportNodeID func(string)) error {
 	target, err := parseServerNodeID(config.ServerNodeID)
 	if err != nil {
 		return err
@@ -50,6 +58,9 @@ func runClient(ctx context.Context, config appConfig, output io.Writer, logger *
 	if err != nil {
 		cancel()
 		return fmt.Errorf("创建 NatClient: %w", err)
+	}
+	if reportNodeID != nil {
+		reportNodeID(string(client.NodeID()))
 	}
 	if err := client.Start(runContext); err != nil {
 		cancel()
@@ -121,7 +132,11 @@ func runClient(ctx context.Context, config appConfig, output io.Writer, logger *
 			connections.Add(1)
 			go func(listener *net.UDPConn, mapping PortMapping) {
 				defer connections.Done()
-				serveClientUDP(runContext, listener, manager, mapping, &nextID, logger, reportRouteError...)
+				reporters := []func(error){}
+				if reportRouteError != nil {
+					reporters = append(reporters, reportRouteError)
+				}
+				serveClientUDP(runContext, listener, manager, mapping, &nextID, logger, reporters...)
 			}(udpListener, mapping)
 			continue
 		}
@@ -149,8 +164,8 @@ func runClient(ctx context.Context, config appConfig, output io.Writer, logger *
 					defer local.Close()
 					stream, streamErr := openRoutedStream(runContext, manager, &nextID, mapping, logger)
 					if streamErr != nil {
-						if len(reportRouteError) > 0 && reportRouteError[0] != nil {
-							reportRouteError[0](fmt.Errorf("映射 %s 连接被 Server 拒绝: %w", mapping.ID, streamErr))
+						if reportRouteError != nil {
+							reportRouteError(fmt.Errorf("映射 %s 连接被 Server 拒绝: %w", mapping.ID, streamErr))
 						}
 						if runContext.Err() == nil {
 							logger.Printf("event=route_rejected mapping=%s err=%v", mapping.ID, streamErr)
