@@ -123,7 +123,7 @@ func TestDevelopmentProfileDisablesExternalCA(t *testing.T) {
 	}
 }
 
-func TestValidateSecretFilePermissions(t *testing.T) {
+func TestValidateSecretFileAcceptsReadablePermissions(t *testing.T) {
 	directory := t.TempDir()
 	filename := filepath.Join(directory, "billing.json")
 	if err := os.WriteFile(filename, []byte("{}\n"), 0o600); err != nil {
@@ -135,8 +135,8 @@ func TestValidateSecretFilePermissions(t *testing.T) {
 	if err := os.Chmod(filename, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := validateSecretFile(filename); err == nil {
-		t.Fatal("validateSecretFile(0644) unexpectedly succeeded")
+	if _, err := validateSecretFile(filename); err != nil {
+		t.Fatalf("validateSecretFile(0644): %v", err)
 	}
 }
 
@@ -174,6 +174,47 @@ func TestConfigFileRoundTripAtomic(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("config mode = %04o, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestParseFlagsPrefersPersistedRoleAndMappingsOverEnvironmentDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	persisted := appConfig{
+		Role:             roleClient,
+		ConfigFile:       path,
+		SecurityProfile:  "development",
+		IndexAddress:     "index.persisted.example:4101",
+		ServerNodeID:     strings.Repeat("b", 64),
+		ListenAddress:    "0.0.0.0:29200",
+		ClientMappings:   []PortMapping{{ID: "remote-http", Protocol: "tcp", Listen: "0.0.0.0:29200", RemotePort: 1124, Enabled: true}},
+		WebListenAddress: "0.0.0.0:8091",
+	}
+	if err := saveConfigFile(path, persisted); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FKNAT_MODE", "server")
+	t.Setenv("FKNAT_FORWARD_TARGET", "127.0.0.1:8080")
+	t.Setenv("FKNAT_WEB_LISTEN", "0.0.0.0:8088")
+	config, _, err := parseFlags([]string{"--config", path}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if config.Role != roleClient {
+		t.Fatalf("role = %q, want client", config.Role)
+	}
+	if config.WebListenAddress != "0.0.0.0:8091" {
+		t.Fatalf("web listen = %q, want persisted address", config.WebListenAddress)
+	}
+	if len(config.ClientMappings) != 1 || config.ClientMappings[0].Listen != "0.0.0.0:29200" || config.ClientMappings[0].RemotePort != 1124 {
+		t.Fatalf("client mappings = %+v, want persisted mapping", config.ClientMappings)
+	}
+
+	config, _, err = parseFlags([]string{"--config", path, "--mode", "server", "--target", "127.0.0.1:9000"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags with explicit flags: %v", err)
+	}
+	if config.Role != roleServer || config.ForwardTarget != "127.0.0.1:9000" {
+		t.Fatalf("explicit flags did not override JSON: role=%q target=%q", config.Role, config.ForwardTarget)
 	}
 }
 

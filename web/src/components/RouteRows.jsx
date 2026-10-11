@@ -20,6 +20,7 @@ function PortEditor({ value, onChange, onSave, onCancel }) {
       <div className="route-grid forwarding-grid">
         <Field title="转发端口"><input value={value.target} placeholder="例如 127.0.0.1:18100" onChange={event => onChange({ target: event.target.value })} /></Field>
         <Field title="传输协议"><ProtocolSelect value={value.protocol} onChange={protocol => onChange({ protocol })} /></Field>
+        <Field title="Server 路由键" hint="多条相同协议规则时用于选择目标"><input type="number" min="0" max="65535" value={value.port || 0} onChange={event => onChange({ port: Number(event.target.value) })} /></Field>
       </div>
       <div className="row-actions"><button className="primary-button small" type="button" onClick={onSave}>保存</button><button className="quiet-button" type="button" onClick={onCancel}>取消</button></div>
     </div>
@@ -49,7 +50,7 @@ export function PortRows({ items, editing, setEditing, onRemove, onUpdate }) {
     }
     return (
       <div className="route-row" key={item.id}>
-        <div><strong>{(item.protocol || 'tcp').toUpperCase()} · 转发端口 {item.target}</strong><small>{item.enabled ? 'RECEIVE AND DISPATCH' : 'DISABLED'}</small></div>
+        <div><strong>{(item.protocol || 'tcp').toUpperCase()} · 路由键 {item.port || '默认'} · 转发到 {item.target}</strong><small>{item.enabled ? 'RECEIVE AND DISPATCH' : 'DISABLED'}</small></div>
         <div className="row-actions"><button className="quiet-button" type="button" onClick={() => setEditing({ kind: 'port', value: { ...item } })}>编辑</button><button className="danger-button" type="button" onClick={() => onRemove(item.id)}>删除</button></div>
       </div>
     );

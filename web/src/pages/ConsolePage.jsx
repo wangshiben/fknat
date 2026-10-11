@@ -11,7 +11,7 @@ import ConfigPage from './ConfigPage.jsx';
 
 const initialForm = { mode: 'client', index_address: '', relay_address: '', server_node_id: '', web_listen_address: '0.0.0.0:8088', security_profile: 'production', billing_key_file: '', identity_file: '' };
 const initialMapping = { protocol: 'tcp', listen: '127.0.0.1:18080', remote_port: 0 };
-const initialPort = { protocol: 'tcp', target: '' };
+const initialPort = { protocol: 'tcp', target: '', port: 0 };
 
 function forwardingPort(target) {
   const match = String(target || '').trim().match(/:(\d+)$/);
@@ -65,15 +65,19 @@ export default function ConsolePage() {
   const removeMapping = id => request(`/api/client/mappings/${encodeURIComponent(id)}`, { method: 'DELETE' }).then(load).catch(err => setError(String(err.message || err)));
   const updateMapping = item => request(`/api/client/mappings/${encodeURIComponent(item.id)}`, { method: 'PUT', headers: jsonHeaders, body: JSON.stringify(item) }).then(() => { setEditing(null); load(); }).catch(err => setError(String(err.message || err)));
   const addPort = () => {
-    const portNumber = forwardingPort(port.target);
-    if (!portNumber) { setError('转发端口必须填写 host:port 格式，例如 127.0.0.1:8080'); return; }
-    request('/api/server/ports', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ ...port, port: portNumber }) }).then(() => { setPort(initialPort); load(); }).catch(err => setError(String(err.message || err)));
+    const targetPort = forwardingPort(port.target);
+    if (!targetPort) { setError('转发端口必须填写 host:port 格式，例如 127.0.0.1:8080'); return; }
+    const routePort = Number(port.port || 0);
+    if (!Number.isInteger(routePort) || routePort < 0 || routePort > 65535) { setError('Server 路由键必须在 0 到 65535 之间'); return; }
+    request('/api/server/ports', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ ...port, port: routePort }) }).then(() => { setPort(initialPort); load(); }).catch(err => setError(String(err.message || err)));
   };
   const removePort = id => request(`/api/server/ports/${encodeURIComponent(id)}`, { method: 'DELETE' }).then(load).catch(err => setError(String(err.message || err)));
   const updatePort = item => {
-    const portNumber = forwardingPort(item.target);
-    if (!portNumber) { setError('转发端口必须填写 host:port 格式，例如 127.0.0.1:8080'); return; }
-    request(`/api/server/ports/${encodeURIComponent(item.id)}`, { method: 'PUT', headers: jsonHeaders, body: JSON.stringify({ ...item, port: portNumber }) }).then(() => { setEditing(null); load(); }).catch(err => setError(String(err.message || err)));
+    const targetPort = forwardingPort(item.target);
+    if (!targetPort) { setError('转发端口必须填写 host:port 格式，例如 127.0.0.1:8080'); return; }
+    const routePort = Number(item.port || 0);
+    if (!Number.isInteger(routePort) || routePort < 0 || routePort > 65535) { setError('Server 路由键必须在 0 到 65535 之间'); return; }
+    request(`/api/server/ports/${encodeURIComponent(item.id)}`, { method: 'PUT', headers: jsonHeaders, body: JSON.stringify({ ...item, port: routePort }) }).then(() => { setEditing(null); load(); }).catch(err => setError(String(err.message || err)));
   };
 
   if (!auth) return <div className="loading-screen"><span className="spinner" />正在连接控制台…</div>;
@@ -91,7 +95,7 @@ export default function ConsolePage() {
       <Sidebar statusGood={statusGood} webAddress={config.web_listen_address} onLogout={logout} />
       <main className="main">
         <Topbar title={section === 'overview' ? '运行概览' : '节点配置'} status={status} statusGood={statusGood} />
-        <div className="content">{error ? <div className="toast error">{error}</div> : null}{section === 'overview' ? <OverviewPage config={config} status={status} statusGood={statusGood} dirty={dirty} statusGuide={statusGuide} mappingRows={mappingRows} portRows={portRows} /> : <ConfigPage form={{ ...form, dirty }} markForm={markForm} save={save} retry={retry} status={status} statusGuide={statusGuide} mapping={mapping} setMapping={setMapping} addMapping={addMapping} port={port} setPort={setPort} addPort={addPort} config={config} portRows={portRows} />}</div>
+      <div className="content">{error ? <div className="toast error">{error}</div> : null}{section === 'overview' ? <OverviewPage config={config} nodeID={state?.node_id} status={status} statusGood={statusGood} dirty={dirty} statusGuide={statusGuide} mappingRows={mappingRows} portRows={portRows} /> : <ConfigPage form={{ ...form, dirty }} markForm={markForm} save={save} retry={retry} status={status} statusGuide={statusGuide} mapping={mapping} setMapping={setMapping} addMapping={addMapping} port={port} setPort={setPort} addPort={addPort} config={config} mappingRows={mappingRows} portRows={portRows} />}</div>
       </main>
     </div>
   );

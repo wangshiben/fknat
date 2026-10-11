@@ -34,6 +34,7 @@ type runtimeController struct {
 	roleGeneration uint64
 	status         string
 	lastErr        string
+	nodeID         string
 	startedAt      time.Time
 	logger         *log.Logger
 	output         io.Writer
@@ -145,6 +146,7 @@ func (controller *runtimeController) startRoleLocked() {
 	controller.stopRoleLocked()
 	controller.roleGeneration++
 	generation := controller.roleGeneration
+	controller.nodeID = ""
 	config := controller.config
 	if !roleReady(config) {
 		controller.status = "waiting_for_configuration"
@@ -168,17 +170,24 @@ func (controller *runtimeController) startRoleLocked() {
 	controller.config = config
 	go func() {
 		var err error
+		reportNodeID := func(nodeID string) {
+			controller.mu.Lock()
+			if controller.roleGeneration == generation {
+				controller.nodeID = nodeID
+			}
+			controller.mu.Unlock()
+		}
 		if config.Role == roleClient {
-			err = runClient(roleContext, config, controller.output, controller.logger, func(routeErr error) {
+			err = runClientWithNodeID(roleContext, config, controller.output, controller.logger, func(routeErr error) {
 				controller.mu.Lock()
 				if controller.roleGeneration == generation && routeErr != nil {
 					controller.lastErr = routeErr.Error()
 					controller.status = "route_error"
 				}
 				controller.mu.Unlock()
-			})
+			}, reportNodeID)
 		} else {
-			err = runServer(roleContext, config, controller.output, controller.logger)
+			err = runServer(roleContext, config, controller.output, controller.logger, reportNodeID)
 		}
 		controller.roleDone <- err
 		controller.mu.Lock()
@@ -217,9 +226,10 @@ func (controller *runtimeController) stopRole() {
 
 func (controller *runtimeController) update(mutator func(*appConfig) error) error {
 	controller.mu.Lock()
-	defer controller.mu.Unlock()
+	previous := controller.config
 	updated := controller.config
 	if err := mutator(&updated); err != nil {
+		controller.mu.Unlock()
 		return err
 	}
 	updated = updated.ensureIDs()
@@ -227,13 +237,21 @@ func (controller *runtimeController) update(mutator func(*appConfig) error) erro
 		updated.ConfigFile = controller.config.ConfigFile
 	}
 	if err := updated.normalizeWebAuth(); err != nil {
+		controller.mu.Unlock()
 		return err
 	}
 	if roleReady(updated) {
 		if err := updated.normalizeAndValidate(); err != nil {
+			controller.mu.Unlock()
 			return err
 		}
 	}
+	controller.mu.Unlock()
+	if err := changeConfiguredNodeMode(controller.rootCtx, previous, updated); err != nil {
+		return err
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
 	if err := saveConfigFile(updated.ConfigFile, updated); err != nil {
 		return err
 	}
@@ -278,6 +296,7 @@ func enabledServerPorts(config appConfig) []AllowedPort {
 type publicRuntime struct {
 	Mode      role         `json:"mode"`
 	Status    string       `json:"status"`
+	NodeID    string       `json:"node_id,omitempty"`
 	LastError string       `json:"last_error,omitempty"`
 	Config    publicConfig `json:"config"`
 	StartedAt time.Time    `json:"started_at"`
@@ -307,7 +326,7 @@ type publicConfig struct {
 func (controller *runtimeController) snapshot() publicRuntime {
 	controller.mu.RLock()
 	defer controller.mu.RUnlock()
-	return publicRuntime{Mode: controller.config.Role, Status: controller.status, LastError: controller.lastErr, StartedAt: controller.startedAt, Config: publicConfig{
+	return publicRuntime{Mode: controller.config.Role, Status: controller.status, NodeID: controller.nodeID, LastError: controller.lastErr, StartedAt: controller.startedAt, Config: publicConfig{
 		Mode: controller.config.Role, IndexAddress: controller.config.IndexAddress, RelayAddress: controller.config.RelayAddress, RelayAddresses: append([]string(nil), controller.config.RelayAddresses...), ServerNodeID: controller.config.ServerNodeID, ListenAddress: controller.config.ListenAddress, ForwardTarget: controller.config.ForwardTarget, RemotePort: controller.config.RemotePort, ClientMappings: append([]PortMapping(nil), controller.config.ClientMappings...), ServerPorts: append([]AllowedPort(nil), controller.config.ServerPorts...), WebListenAddress: controller.config.WebListenAddress, WebUser: controller.config.WebUser, AuthRequired: controller.webAuthRequired(), ConfigFile: controller.config.ConfigFile, SecurityProfile: controller.config.SecurityProfile, BillingKeyFile: controller.config.BillingKeyFile, IdentityFile: controller.config.IdentityFile,
 	}}
 }

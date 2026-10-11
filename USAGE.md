@@ -143,6 +143,10 @@ FKNAT_WEB_PASSWORD=change-this-password
 配置文件默认是 `~/.config/fknat/config.json`，可用 `--config` 或
 `FKNAT_CONFIG_FILE` 指定。
 
+安装包的 `config/app.env` 仅作为首次启动和缺省配置；Web 保存到 `data/config.json`
+后，JSON 中已有字段优先于环境变量。修改角色、映射或转发端口后无需同步改写
+`FKNAT_MODE` 等旧环境值，重启服务会继续使用 JSON 配置。
+
 ## 5. 配置 NAT Server
 
 Server 的作用是注册 NodeID，并把收到的逻辑流连接到本机后端服务。安装包使用
@@ -196,10 +200,11 @@ sudo /opt/fknat/control.sh logs
 [2001:db8::1]:443       指定 IPv6 服务
 ```
 
-Server 也可以在 Web 页面中添加多个转发端口。每条规则包含协议（TCP/UDP）和本机
-转发目标（`host:port`）。单个目标会在收到流后直接连接，不会在 Server 上额外
-监听请求端口；多个目标时由 Client 映射携带目标端口进行分流。未列入规则的请求
-会被拒绝，Client 页面会显示拒绝原因并提供重试按钮。
+Server 也可以在 Web 页面中添加多个转发端口。每条规则包含协议（TCP/UDP）、独立的
+Server 路由键和本机转发目标（`host:port`）。单个目标的路由键可以填 `0`；多个同协议
+目标应填写不同路由键，并在 Client 映射中使用相同的 `remote_port`。Server 收到流后直接
+连接目标，不会额外监听请求端口。未列入规则的请求会被拒绝，Client 页面会显示拒绝原因
+并提供重试按钮。
 
 ### 多 Relay Server
 
@@ -262,7 +267,8 @@ FKNAT_SERVER_NODE_ID=<NAT Server 输出的 64 位 NodeID>
 
 需要多个映射或 UDP 时，推荐在 Web 页面添加映射。UDP 映射使用一条隧道流承载一个
 请求/响应数据报，适合 DNS 等请求响应型服务。TCP 和 UDP 请求都会携带连接 ID、协议
-类型和 Server 目标端口的路由头，由 Server 的允许列表校验后再拨号后端。
+类型和 Server 路由键的路由头，由 Server 的允许列表校验后再拨号后端；例如 Server
+配置路由键 `1001` 指向 `127.0.0.1:18888` 时，Client 映射的 `remote_port` 也填写 `1001`。
 
 ## 7. Index、Relay 和连接行为
 
@@ -363,7 +369,7 @@ curl -fsS https://ca.fknat.top/readyz
 
 1. 检查 `ca.fknat.top` 解析和 CA Web 健康状态。
 2. 检查 Index/Relay 地址以及 TCP/UDP 端口可达性。
-3. 检查 `billing-key` 权限是否为 `0600`。
+3. 检查 `billing-key` 文件是否存在且当前进程可读。
 4. 确认 NAT Server 打印的 NodeID 与 Client 的 `--server-id` 完全一致。
 5. 确认 NAT Server 的 `--target` 或转发端口可以从本机连接。
 6. 检查 Client/Server 日志中的注册、拨号、重连和后端连接错误。
@@ -375,5 +381,3 @@ curl -fsS https://ca.fknat.top/readyz
   • macOS：/usr/local/lib/fknat/log/
   • Windows：%ProgramData%\FkNat\fknat\log\
 ```
-
-

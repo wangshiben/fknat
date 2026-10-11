@@ -72,6 +72,31 @@ func TestResolveAllowedTarget(t *testing.T) {
 	}
 }
 
+func TestResolveAllowedTargetSelectsDistinctRouteKeys(t *testing.T) {
+	ports := []AllowedPort{
+		{ID: "web", Protocol: "tcp", Port: 1001, Target: "127.0.0.1:18888", Enabled: true},
+		{ID: "api", Protocol: "tcp", Port: 1002, Target: "127.0.0.1:19999", Enabled: true},
+	}
+	for _, test := range []struct {
+		name       string
+		remotePort uint16
+		want       string
+	}{
+		{name: "web", remotePort: 1001, want: "127.0.0.1:18888"},
+		{name: "api", remotePort: 1002, want: "127.0.0.1:19999"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := resolveAllowedTarget(ports, "", routeHeader{Transport: transportTCP, RemotePort: test.remotePort})
+			if !ok || got != test.want {
+				t.Fatalf("target=%q ok=%v, want %q", got, ok, test.want)
+			}
+		})
+	}
+	if _, ok := resolveAllowedTarget(ports, "", routeHeader{Transport: transportTCP, RemotePort: 1003}); ok {
+		t.Fatal("unexpectedly allowed unknown route key")
+	}
+}
+
 func TestRouteHeaderRejectsReservedBytes(t *testing.T) {
 	payload := encodeRouteHeader(routeHeader{ConnectionID: 1, Transport: transportTCP, RemotePort: 80})
 	payload[18] = 1

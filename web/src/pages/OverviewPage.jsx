@@ -1,12 +1,16 @@
-export default function OverviewPage({ config, status, statusGood, dirty, statusGuide, mappingRows, portRows }) {
+export default function OverviewPage({ config, nodeID, status, statusGood, dirty, statusGuide, mappingRows, portRows }) {
   return (
     <>
       <section className="stats-grid">
         <article className="stat-card accent"><p>运行状态</p><strong>{status}</strong><small>{config.mode || '未选择模式'}</small></article>
-        <article className="stat-card"><p>节点角色</p><strong>{config.mode ? config.mode.toUpperCase() : '—'}</strong><small>{config.server_node_id ? `${config.server_node_id.slice(0, 16)}…` : '等待 NodeID'}</small></article>
+        <article className="stat-card"><p>节点角色</p><strong>{config.mode ? config.mode.toUpperCase() : '—'}</strong><small>{nodeID ? `${nodeID.slice(0, 16)}…` : '等待 NodeID'}</small></article>
         <article className="stat-card"><p>入口 Relay</p><strong>{config.relay_address || 'INDEX'}</strong><small>{config.index_address || 'CA 自动发现'}</small></article>
       </section>
       {statusGuide}
+      <section className="panel node-id-panel">
+        <div className="panel-head"><div><p className="kicker">NODE IDENTITY</p><h2>当前 NodeID</h2></div><span className={nodeID ? 'panel-tag success' : 'panel-tag'}>{nodeID ? 'READY' : 'WAITING'}</span></div>
+        <div className="node-id-value"><code>{nodeID || '节点启动后生成并显示'}</code></div>
+      </section>
       <section className="panel">
         <div className="panel-head"><div><p className="kicker">LIVE CONFIGURATION</p><h2>连接参数</h2></div><span className={statusGood ? 'panel-tag success' : 'panel-tag'}>{dirty ? 'UNSAVED' : 'SYNCED'}</span></div>
         <div className="config-summary"><div><span>Web</span><code>{config.web_listen_address || '0.0.0.0:8088'}</code></div><div><span>Index</span><code>{config.index_address || 'CA DISCOVERY'}</code></div><div><span>Security</span><code>{config.security_profile || 'production'}</code></div></div>

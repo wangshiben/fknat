@@ -21,7 +21,7 @@
 节点身份密钥和扣费密钥是两种不同的密钥：
 
 - 节点身份默认自动生成到用户配置目录中的 `fknat/client.identity` 或 `fknat/server.identity`，用于保持 NodeID 稳定。
-- `--billing-key` 必须指向 CA Web 导出的扣费私钥 JSON 文件。文件权限必须为 `0600` 或更严格。
+- `--billing-key` 必须指向 CA Web 导出的扣费私钥 JSON 文件，文件只需可读即可。
 - fknat 不会复制、打印或写入扣费私钥内容。不要把扣费私钥粘贴到 `--identity`，也不建议把密钥内容直接放在命令行参数中。
 - production 安全档必须配置扣费私钥。
 
@@ -113,6 +113,8 @@ fknat 启动后默认监听 `0.0.0.0:8088`，根路径会返回内置的 React �
 
 页面提供两个路由：`/overview` 运行概览和 `/config` 节点配置。即使 NodeID、端口或扣费密钥路径还没有填写，Web 服务仍会启动并显示 `waiting_for_configuration`。完成配置后点击“保存并启动”，程序会原子写入 `~/.config/fknat/config.json`（可用 `--config` 或 `FKNAT_CONFIG_FILE` 指定），并自动启动或重启对应的 Client/Server 运行时。运行状态每 3 秒刷新；连接异常时使用“重试连接”，错误会同时显示在页面和进程日志中。
 
+安装包的 `config/app.env` 只提供首次启动和缺省值；Web 保存后的 JSON 配置优先级更高。这样在页面中把 Server 切换为 Client（或反过来）后，服务重启仍会按 `data/config.json` 中保存的角色、映射和端口启动，不会被旧的 `FKNAT_MODE` 等环境值覆盖。
+
 Web 管理界面默认启用登录保护。首次启动且没有现成认证配置时，程序会创建用户名 `admin`，随机生成一条初始密码，并将 bcrypt 哈希保存到配置文件；初始密码只在启动日志中显示一次。生产环境可以显式配置：
 
 ```bash
@@ -140,9 +142,9 @@ FKNAT_WEB_PASSWORD=change-this-password
 
 Client 映射和 Server 转发端口都可以在页面中添加、编辑和删除；Server 规则会在“运行概览”和“转发端口预览”中同步显示。`waiting_for_configuration` 只代表业务配置尚未完成，不代表 Web 服务故障。
 
-Client 页面支持添加、编辑和删除多个 TCP/UDP 映射，例如 `127.0.0.1:18080` → Server 的本机目标。Server 页面支持动态维护 TCP/UDP 转发端口，每条规则直接填写本机 `host:port` 目标；单个目标无需指定路由键，多个目标时按目标端口分流。每个隧道流在业务数据前带有版本化路由头（连接 ID、传输类型、可选路由键），Server 收到后直接连接本机目标并返回明确的接受或拒绝响应。UDP 使用一条隧道流承载一个请求/响应数据报，适用于 DNS 和常见请求响应型 UDP 服务。
+Client 页面支持添加、编辑和删除多个 TCP/UDP 映射，例如 `127.0.0.1:18080` → Server 的本机目标。Server 页面支持动态维护 TCP/UDP 转发端口，每条规则直接填写本机 `host:port` 目标和独立的“Server 路由键”；单个目标的路由键可填 `0`，多个同协议目标应填写不同路由键，并在 Client 映射中使用相同的 `remote_port`。每个隧道流在业务数据前带有版本化路由头（连接 ID、传输类型、路由键），Server 收到后直接连接本机目标并返回明确的接受或拒绝响应。UDP 使用一条隧道流承载一个请求/响应数据报，适用于 DNS 和常见请求响应型 UDP 服务。
 
-Web 中的 `waiting_for_configuration` 表示 Web 控制台已启动，但节点运行条件还没有满足；选择角色、填写必要字段和映射后点击“保存并启动”即可触发运行。production 安全档还需要 CA Web 导出的扣费密钥路径。Server 收到远端流后会直接按协议连接本机转发端口，不会额外监听或请求一个 Server 端口。单个目标由默认路由直接连接；多个目标时 Client 映射携带目标端口进行分流，例如目标 `127.0.0.1:8080`。
+Web 中的 `waiting_for_configuration` 表示 Web 控制台已启动，但节点运行条件还没有满足；选择角色、填写必要字段和映射后点击“保存并启动”即可触发运行。production 安全档还需要 CA Web 导出的扣费密钥路径。Server 收到远端流后会直接按协议连接本机转发端口，不会额外监听或请求一个 Server 端口。单个目标由默认路由直接连接；多个目标时 Client 映射的 Server 路由键必须与 Server 规则一致，例如 Server 配置 `1001 -> 127.0.0.1:18888`，Client 映射使用 `remote_port=1001`。
 
 ## 当前协议范围
 
