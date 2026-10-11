@@ -1,6 +1,7 @@
 # fknat
 
 > 相关链接详见: [urls.md](urls.md)
+> 项目具体介绍如下/牢骚 : [introduction](introduction.md)
 
 `fknat` 是基于 [`natP2pSDK`](https://github.com/wangshiben/natP2pSDK) 的双角色 TCP 端口转发工具。一个二进制既可以作为 NatClient，也可以作为 NatServer：
 
