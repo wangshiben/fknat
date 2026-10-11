@@ -2,6 +2,7 @@
 /dist/
 /web/node_modules/
 /web/.vite/
+/web/dist/
 /test-results/
 *.log
 coverage.out
